@@ -1,5 +1,12 @@
 # PHP2Shell Reproduction Lab
 
+[![reproduce](https://github.com/lesterlam/php2shell-lab/actions/workflows/reproduce.yml/badge.svg)](https://github.com/lesterlam/php2shell-lab/actions/workflows/reproduce.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+**Live visualiser:** <https://lesterlam.github.io/php2shell-lab/>
+
+![PHP2Shell trigger-condition visualiser](assets/screenshot.png)
+
 A minimal, dependency-light lab that reproduces the **trigger condition** behind
 CVE-2026-109618 / CVE-2026-109619 — the October 2026 PHP core remote code
 execution disclosed as "PHP2Shell" (CVSS 4.0 **9.2**).
@@ -57,7 +64,8 @@ its extracted rootfs.
 ```bash
 ./fetch-php.sh 8.4.26     # vulnerable  (~1.1 GB)
 ./fetch-php.sh 8.4.27     # patched     (~1.1 GB)
-./demo.sh
+./demo.sh                 # interactive A/B walkthrough
+./verify.sh               # non-interactive gate: exits 0 iff vulnerable != patched
 ```
 
 `demo.sh` starts both builds, sends the same payload to each, and prints a
@@ -103,9 +111,12 @@ fetch-php.sh        pull + extract a PHP image via the Registry API (no daemon)
 phpv.sh             run an extracted PHP with its own dynamic loader
 probe.py            crafted multipart body + verdict
 demo.sh             one-command A/B walkthrough
+verify.sh           non-interactive gate (asserts vulnerable != patched)
 www/                minimal probe endpoints
 docs/ANALYSIS.md    root-cause and patch analysis
 docs/index.html     interactive visualiser (GitHub Pages)
+assets/             README screenshot
+.github/workflows/  CI: fetches runtimes and runs the gate
 runtimes/           downloaded PHP builds (gitignored)
 ```
 
