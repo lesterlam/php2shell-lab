@@ -1,0 +1,72 @@
+name: reproduce
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reproduce:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Runner details
+        run: |
+          uname -a
+          python3 --version
+          curl --version | head -1
+          echo "no Docker daemon required; no root required"
+
+      - name: Cache PHP runtimes
+        uses: actions/cache@v4
+        with:
+          path: runtimes
+          key: php-runtimes-8.4.26-8.4.27-v1
+
+      - name: Fetch PHP runtimes
+        run: |
+          ./fetch-php.sh 8.4.26
+          ./fetch-php.sh 8.4.27
+
+      - name: Assert vulnerable triggers and patched does not
+        run: ./verify.sh | tee verify-output.txt
+
+      - name: Full A/B walkthrough
+        if: always()
+        run: ./demo.sh | tee demo-output.txt
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## PHP2Shell reproduction"
+            echo
+            echo "### Gate"
+            echo
+            echo '```'
+            cat verify-output.txt 2>/dev/null || echo "(gate did not run)"
+            echo '```'
+            echo
+            echo "### Walkthrough"
+            echo
+            echo '```'
+            cat demo-output.txt 2>/dev/null || echo "(walkthrough did not run)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-output
+          path: |
+            verify-output.txt
+            demo-output.txt
+          if-no-files-found: warn
