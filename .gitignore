@@ -1,0 +1,15 @@
+# Downloaded PHP runtimes (~1.1 GB each) — always re-fetched with ./fetch-php.sh
+runtimes/
+
+# Pull metadata / scratch
+index.json
+manifest.json
+layer.tmp
+
+# Runtime output
+logs/
+*.log
+
+# Python
+__pycache__/
+*.pyc

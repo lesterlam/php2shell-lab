@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PHP2Shell — trigger-condition visualiser</title>
+<meta name="description" content="Interactive visualiser of measured memory behaviour for CVE-2026-109618 (PHP2Shell).">
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2230; --line:#2a3240;
+    --fg:#e6edf3; --muted:#8b949e; --accent:#58a6ff;
+    --danger:#f85149; --ok:#3fb950; --warn:#d29922;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--bg); color:var(--fg);
+    font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  .wrap{max-width:960px;margin:0 auto;padding:32px 20px 72px}
+  header h1{font-size:26px;margin:0 0 6px;letter-spacing:-.4px}
+  header p.sub{margin:0;color:var(--muted)}
+  .badge{
+    display:inline-flex;align-items:center;gap:7px;margin:18px 0 0;
+    padding:7px 12px;border:1px solid rgba(210,153,34,.4);background:rgba(210,153,34,.08);
+    border-radius:6px;color:var(--warn);font-size:12.5px
+  }
+  .grid{display:grid;gap:18px;margin-top:26px}
+  @media(min-width:760px){ .grid.two{grid-template-columns:1fr 1fr} }
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:20px}
+  .card h2{margin:0 0 14px;font-size:14px;text-transform:uppercase;letter-spacing:.9px;color:var(--muted);font-weight:600}
+  .ctl{margin-bottom:20px}
+  .ctl label{display:block;font-size:13px;color:var(--muted);margin-bottom:8px}
+  .ctl .val{color:var(--fg);font-weight:600;font-variant-numeric:tabular-nums}
+  input[type=range]{width:100%;accent-color:var(--accent)}
+  select{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:8px 10px;font-size:14px}
+  .seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+  .seg button{
+    background:transparent;color:var(--muted);border:0;padding:9px 15px;font-size:13.5px;
+    cursor:pointer;font-family:inherit
+  }
+  .seg button.on{background:var(--panel2);color:var(--fg);font-weight:600}
+  .seg button.on.vuln{color:var(--danger)}
+  .seg button.on.patch{color:var(--ok)}
+  .metric{display:flex;justify-content:space-between;align-items:baseline;padding:9px 0;border-bottom:1px solid var(--line)}
+  .metric:last-child{border-bottom:0}
+  .metric .k{color:var(--muted);font-size:13.5px}
+  .metric .v{font-variant-numeric:tabular-nums;font-weight:600}
+  .bars{margin-top:6px}
+  .barrow{margin-bottom:16px}
+  .barrow .lbl{display:flex;justify-content:space-between;font-size:12.5px;color:var(--muted);margin-bottom:6px}
+  .track{position:relative;height:26px;background:var(--panel2);border-radius:6px;overflow:hidden}
+  .fill{height:100%;transition:width .12s ease}
+  .fill.wire{background:linear-gradient(90deg,#1f6feb,#58a6ff)}
+  .fill.mem{background:linear-gradient(90deg,#b62324,#f85149)}
+  .fill.mem.ok{background:linear-gradient(90deg,#196c2e,#3fb950)}
+  .limitline{position:absolute;top:0;bottom:0;width:2px;background:#e6edf3;opacity:.85}
+  .limitlab{position:absolute;top:-1px;font-size:10.5px;color:#e6edf3;background:#0d1117;padding:1px 4px;border-radius:3px;transform:translateX(-50%)}
+  .verdict{margin-top:6px;border-radius:9px;padding:16px 18px;border:1px solid;font-weight:600}
+  .verdict.hit{border-color:rgba(248,81,73,.5);background:rgba(248,81,73,.1);color:#ff9d96}
+  .verdict.safe{border-color:rgba(63,185,80,.45);background:rgba(63,185,80,.09);color:#7ee2a8}
+  .verdict .small{display:block;font-weight:400;font-size:12.5px;color:var(--muted);margin-top:5px}
+  table{width:100%;border-collapse:collapse;font-size:13.5px;font-variant-numeric:tabular-nums}
+  th,td{text-align:right;padding:8px 8px;border-bottom:1px solid var(--line)}
+  th:first-child,td:first-child{text-align:left}
+  th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px}
+  tr.hitrow td{color:#ff9d96}
+  .steps{counter-reset:s;list-style:none;padding:0;margin:0}
+  .steps li{position:relative;padding:14px 0 14px 46px;border-bottom:1px solid var(--line)}
+  .steps li:last-child{border-bottom:0}
+  .steps li::before{
+    counter-increment:s;content:counter(s);position:absolute;left:0;top:13px;
+    width:28px;height:28px;border-radius:50%;background:var(--panel2);border:1px solid var(--line);
+    display:grid;place-items:center;font-size:13px;font-weight:700;color:var(--muted)
+  }
+  .steps li.done::before{background:rgba(248,81,73,.15);border-color:rgba(248,81,73,.5);color:#ff9d96}
+  .steps li .t{font-weight:600}
+  .steps li .d{color:var(--muted);font-size:13.5px}
+  .tag{font-size:11px;padding:2px 7px;border-radius:999px;margin-left:8px;vertical-align:middle;font-weight:600}
+  .tag.done{background:rgba(248,81,73,.15);color:#ff9d96;border:1px solid rgba(248,81,73,.4)}
+  .tag.gap{background:rgba(139,148,158,.14);color:var(--muted);border:1px solid var(--line)}
+  code{background:var(--panel2);padding:2px 6px;border-radius:4px;font-size:12.5px}
+  footer{margin-top:34px;padding-top:18px;border-top:1px solid var(--line);color:var(--muted);font-size:12.5px}
+  a{color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>PHP2Shell — trigger-condition visualiser</h1>
+    <p class="sub">CVE-2026-109618 · CVSS 4.0 9.2 · PHP core remote code execution</p>
+    <div class="badge">⚠︎ Educational illustration of data measured in the lab — not a live vulnerable service</div>
+  </header>
+
+  <div class="grid two">
+
+    <div class="card">
+      <h2>Configuration</h2>
+
+      <div class="ctl">
+        <label>Build</label>
+        <div class="seg" id="seg">
+          <button data-v="vuln" class="on vuln">8.4.26 · vulnerable</button>
+          <button data-v="patch">8.4.27 · patched</button>
+        </div>
+      </div>
+
+      <div class="ctl">
+        <label>Multipart part headers <span class="val" id="hv">250,000</span></label>
+        <input type="range" id="h" min="0" max="700000" step="5000" value="250000">
+      </div>
+
+      <div class="ctl" style="margin-bottom:0">
+        <label>memory_limit</label>
+        <select id="ml">
+          <option value="32">32 MiB</option>
+          <option value="64" selected>64 MiB</option>
+          <option value="128">128 MiB</option>
+          <option value="256">256 MiB</option>
+        </select>
+        <span style="color:var(--muted);font-size:12.5px;margin-left:10px">post_max_size = 256 MiB</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Request cost</h2>
+      <div class="metric"><span class="k">Wire body</span><span class="v" id="m-wire">—</span></div>
+      <div class="metric"><span class="k">PHP peak memory</span><span class="v" id="m-peak">—</span></div>
+      <div class="metric"><span class="k">Amplification</span><span class="v" id="m-amp">—</span></div>
+      <div class="metric"><span class="k">Wire as % of post_max_size</span><span class="v" id="m-pct">—</span></div>
+      <div class="verdict safe" id="verdict">—</div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:18px">
+    <h2>Memory picture</h2>
+    <div class="bars">
+      <div class="barrow">
+        <div class="lbl"><span>Wire bytes (what the attacker sends)</span><span id="l-wire">—</span></div>
+        <div class="track"><div class="fill wire" id="f-wire" style="width:0%"></div>
+          <div class="limitline" style="left:100%"></div>
+        </div>
+      </div>
+      <div class="barrow" style="margin-bottom:0">
+        <div class="lbl"><span>PHP request memory (what it costs the server)</span><span id="l-mem">—</span></div>
+        <div class="track"><div class="fill mem ok" id="f-mem" style="width:0%"></div>
+          <div class="limitline" id="lim" style="left:0%"></div>
+          <div class="limitlab" id="limlab" style="left:0%">limit</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:18px">
+    <h2>Measured data (memory_limit 64 MiB)</h2>
+    <table id="tbl">
+      <thead><tr><th>Part headers</th><th>Wire</th><th>8.4.26 peak</th><th>8.4.27 peak</th><th>Outcome</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <p style="color:var(--muted);font-size:12.5px;margin:14px 0 0">
+      Values between the measured points are linearly interpolated; values beyond the
+      last measured point are extrapolated along the final slope. Patched builds were flat
+      at 2 MiB across every payload tested.
+    </p>
+  </div>
+
+  <div class="card" style="margin-top:18px">
+    <h2>Where this sits in the exploitation chain</h2>
+    <ol class="steps">
+      <li class="done"><span class="t">Reach OOM inside the declared limits</span><span class="tag done">demonstrated</span>
+        <div class="d">A small multipart body exhausts <code>memory_limit</code> while staying far inside <code>post_max_size</code>, during request startup.</div></li>
+      <li><span class="t">Control content, location and timing of the corrupted memory</span><span class="tag gap">not demonstrated</span>
+        <div class="d">Heap grooming against both glibc malloc and Zend's allocator, so the invalid state contains attacker-chosen bytes.</div></li>
+      <li><span class="t">Turn a read into a jump</span><span class="tag gap">not demonstrated</span>
+        <div class="d">The stale value must be used as a pointer, length or index — plus an information leak to defeat ASLR/PIE.</div></li>
+      <li><span class="t">Bypass mitigations</span><span class="tag gap">not demonstrated</span>
+        <div class="d">NX requires a ROP chain; stack canaries and CET/shadow stack add further constraints.</div></li>
+      <li><span class="t">Make it reliable</span><span class="tag gap">not demonstrated</span>
+        <div class="d">Consistent exploitation across a multi-worker prefork pool under normal traffic.</div></li>
+    </ol>
+    <p style="color:var(--muted);font-size:12.5px;margin:14px 0 0">
+      No public proof-of-concept exists for stages 2–5. A successful RCE yields code execution as the
+      web worker account (<code>www-data</code>), not root — privilege escalation is a separate step.
+    </p>
+  </div>
+
+  <footer>
+    Data from a local lab (PHP 8.4.26 vs 8.4.27, <code>127.0.0.1</code>).
+    Advisory: GHSA-w8hw-w9fx-j79w · Fix commit <code>506e87fa</code> · Fixed in 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12.
+  </footer>
+</div>
+
+<script>
+// Measured points: [headers, wireBytes, vulnPeakBytes, patchedPeakBytes]
+const DATA = [
+  [0,        9030,      2097152,  2097152],
+  [10000,   189029,     4194304,  2097152],
+  [50000,   989029,    16777216,  2097152],
+  [100000, 1989029,    33554432,  2097152],
+  [150000, 3039029,    50331648,  2097152],
+  [200000, 4089029,    65011712,  2097152],
+];
+const MI = 1048576;
+let build = 'vuln';
+
+function interp(n, idx) {
+  if (n <= DATA[0][0]) return DATA[0][idx];
+  const last = DATA[DATA.length - 1];
+  if (n >= last[0]) {                       // extrapolate along final slope
+    const prev = DATA[DATA.length - 2];
+    const slope = (last[idx] - prev[idx]) / (last[0] - prev[0]);
+    return last[idx] + (n - last[0]) * slope;
+  }
+  for (let i = 0; i < DATA.length - 1; i++) {
+    const a = DATA[i], b = DATA[i + 1];
+    if (n >= a[0] && n <= b[0]) {
+      const t = (n - a[0]) / (b[0] - a[0]);
+      return a[idx] + t * (b[idx] - a[idx]);
+    }
+  }
+  return 0;
+}
+
+function fmt(b) {
+  if (b >= MI) return (b / MI).toFixed(1) + ' MiB';
+  if (b >= 1024) return (b / 1024).toFixed(0) + ' KB';
+  return b + ' B';
+}
+
+function render() {
+  const n = +document.getElementById('h').value;
+  const limit = +document.getElementById('ml').value * MI;
+  const wire = interp(n, 1);
+  const peak = build === 'vuln' ? interp(n, 2) : interp(n, 3);
+  const oom = build === 'vuln' && peak > limit;
+
+  document.getElementById('hv').textContent = n.toLocaleString();
+  document.getElementById('m-wire').textContent = fmt(wire) + '  (' + wire.toLocaleString() + ' B)';
+  document.getElementById('m-peak').textContent = fmt(peak);
+  document.getElementById('m-amp').textContent = wire > 0 ? (peak / wire).toFixed(1) + '×' : '—';
+  document.getElementById('m-pct').textContent = (wire / (256 * MI) * 100).toFixed(3) + ' %';
+
+  // bars: wire relative to post_max_size; memory relative to limit (log-free, capped)
+  document.getElementById('f-wire').style.width = Math.min(100, wire / (256 * MI) * 100) + '%';
+  document.getElementById('l-wire').textContent = fmt(wire) + ' / 256 MiB';
+  const memPct = Math.min(100, peak / limit * 100);
+  const memFill = document.getElementById('f-mem');
+  memFill.style.width = memPct + '%';
+  memFill.className = 'fill mem' + (oom ? '' : ' ok');
+  document.getElementById('l-mem').textContent = fmt(peak) + ' / ' + fmt(limit);
+  document.getElementById('lim').style.left = '100%';
+  document.getElementById('limlab').style.left = '100%';
+
+  const v = document.getElementById('verdict');
+  if (oom) {
+    v.className = 'verdict hit';
+    v.innerHTML = 'OOM DURING REQUEST STARTUP — application code never ran' +
+      '<span class="small">Parsing aborts before any application code executes: authentication, ' +
+      'nonces and upload validation are never consulted.</span>';
+  } else {
+    v.className = 'verdict safe';
+    v.innerHTML = 'APP REACHED — request parsed normally' +
+      '<span class="small">' + (build === 'vuln'
+        ? 'Peak memory stays under memory_limit for this payload.'
+        : 'Patched build does not retain attacker-controlled part headers; peak stays flat at 2 MiB.') +
+      '</span>';
+  }
+}
+
+// measured-data table
+(function () {
+  const tb = document.querySelector('#tbl tbody');
+  const rows = [
+    [10000, 189029, 4194304, 2097152, false],
+    [50000, 989029, 16777216, 2097152, false],
+    [100000, 1989029, 33554432, 2097152, false],
+    [150000, 3039029, 50331648, 2097152, false],
+    [200000, 4089029, 65011712, 2097152, false],
+    [250000, 5139029, null, 2097152, true],
+    [400000, 8289029, null, 2097152, true],
+    [700000, 14589029, null, 2097152, true],
+  ];
+  for (const [h, w, vp, pp, hit] of rows) {
+    const tr = document.createElement('tr');
+    if (hit) tr.className = 'hitrow';
+    tr.innerHTML = '<td>' + h.toLocaleString() + '</td><td>' + fmt(w) + '</td>' +
+      '<td>' + (vp === null ? 'OOM' : fmt(vp)) + '</td><td>' + fmt(pp) + '</td>' +
+      '<td>' + (hit ? 'aborted' : 'ok') + '</td>';
+    tb.appendChild(tr);
+  }
+})();
+
+document.getElementById('seg').addEventListener('click', e => {
+  const b = e.target.closest('button'); if (!b) return;
+  build = b.dataset.v;
+  [...e.currentTarget.children].forEach(c => {
+    c.className = c === b ? ('on ' + (build === 'vuln' ? 'vuln' : 'patch')) : '';
+  });
+  render();
+});
+document.getElementById('h').addEventListener('input', render);
+document.getElementById('ml').addEventListener('change', render);
+render();
+</script>
+</body>
+</html>
