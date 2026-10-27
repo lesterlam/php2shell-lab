@@ -19,7 +19,9 @@ REPO="library/php"
 REG="https://registry-1.docker.io"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUNTIMES="${PHP_LAB_RUNTIMES:-$HERE/runtimes}"
-DEST="$RUNTIMES/php-$VER"
+SUFFIX=""
+[ "$SAPI" != "cli" ] && SUFFIX="-$SAPI"
+DEST="$RUNTIMES/php-$VER$SUFFIX"
 
 if [ -x "$DEST/rootfs/usr/local/bin/php" ]; then
   echo "[=] $DEST already present, nothing to do"
@@ -79,4 +81,4 @@ for dg in $(python3 -c 'import json; [print(l["digest"]) for l in json.load(open
 done
 
 echo "[=] done -> $DEST/rootfs"
-"$HERE/phpv.sh" "$VER" -v | head -1
+"$HERE/phpv.sh" "$VER$SUFFIX" -v | head -1
