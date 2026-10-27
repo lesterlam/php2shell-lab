@@ -240,9 +240,9 @@
       <thead><tr><th>Question</th><th>Measurement</th></tr></thead>
       <tbody>
         <tr><td>Does the stale pointer land inside a buffer we control?</td>
-            <td><strong>Yes</strong> — a 1024-byte value contains it (at <code>+0x278</code> in one run, <code>+0x128</code> in another: the offset moves, the containment does not), 4096 B at <code>+0x78</code>, 8192 B at <code>+0x78</code>. A 256-byte value does not, which is why the Stage 2 sweep never left its own buffer. <code>stage3.py</code> scouts the offset at runtime rather than assuming it.</td></tr>
+            <td><strong>Yes</strong> — a 1024-byte value contains it (at <code>+0x278</code> in one run, <code>+0x128</code> in another: the offset moves, the containment does not), 4096 B at <code>+0x78</code>, 8192 B at <code>+0x78</code>. A 256-byte value does not, which is why the Stage 2 sweep never left its own buffer. <code>stage3.py</code> discovers the shape and the offset at runtime rather than assuming either.</td></tr>
         <tr><td>Is the emitted length ours to choose?</td>
-            <td><strong>Yes</strong> — claiming <code>0x1234</code> produced a <strong>4660-byte</strong> session id, 4 of 4 runs.</td></tr>
+            <td><strong>Yes</strong> — claiming <code>0x1234</code> produced a <strong>4660-byte</strong> session id in every run that completed a rep (2 of 3 reps on fresh pools; 4 of 4 in an earlier run, before the pools were split per rep).</td></tr>
         <tr><td>Is the tail memory we did not write?</td>
             <td><strong>Yes</strong> — marker bytes from <em>other</em> allocations appear in the output, plus nine heap-like <code>0x7…</code> values spaced <code>0x40</code> apart, i.e. a HashTable bucket array.</td></tr>
       </tbody>
