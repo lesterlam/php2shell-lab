@@ -422,8 +422,8 @@ mode — on its own pool, with several shapes already through it — was simulta
 measuring `+0x138` at that same size. Where the stale pointer lands depends on the
 pool's accumulated history, not only on the request, so a shape that works on a warmed
 pool does nothing on a fresh one. Discovering the shape per mode, rather than assuming
-one, is what made the claim reproducible — and it is why each mode gets its own pool
-(§7.6): the measurement has to be self-contained.
+one, is what made the claim reproducible — and it is why claim and leak get a fresh
+pool per rep (§7.7): the measurement has to be self-contained.
 
 4660 = `0x1234`. The length is now decoupled from the buffer it is read from.
 
@@ -495,14 +495,24 @@ exploit.
 ### 7.7 Reproducing
 
 ```bash
-./build-instrumented.sh    # php 8.4.26 + probes A/B/C
-PORT=18627 ./stage3.sh     # fresh pool: control -> containment -> claim -> leak
+./build-instrumented.sh    # php 8.4.26 + probes A/B/C, a few minutes
+PORT=18627 ./stage3.sh     # control -> containment -> claim -> leak
 ```
 
-`stage3.sh` starts its own server because the control is only valid on a pool that
-has never served an OOM request. Reusing a pool would show a stale `PS(id)` with no
-producer in flight, and `stage3.py` reports that instead of presenting it as a
-control.
+`stage3.sh` starts its own server per measurement, because the control is only valid
+on a pool that has never served an OOM request. Reusing a pool would show a stale
+`PS(id)` with no producer in flight, and `stage3.py` reports that instead of
+presenting it as a control.
+
+Pools are also spent by the measurement itself. A pool tolerates roughly **three**
+corrupting requests before Zend aborts it, and discovery costs producers: claim and
+leak sweep the value-size classes to find a shape that contains the stale pointer,
+then spend one more request on the stamped read. Running three reps inside one pool
+therefore spent the pool's tolerance on rep 0 and reported `server died` for the rest,
+which is indistinguishable from the bug failing to reproduce. So claim and leak get a
+**fresh pool per rep**, and the gate asks for at least one success rather than all of
+them — the run that gates CI reports claim 2/3 and leak 3/3, against a control that is
+clean and containment that is found every time.
 
 ## 8. Limitations of this reproduction
 

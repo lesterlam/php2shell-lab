@@ -1,15 +1,25 @@
 #!/usr/bin/env bash
-# Stage 3 walkthrough: build the instrumented php, then run each measurement mode
-# against its OWN fresh worker pool.
+# Stage 3 walkthrough: build the instrumented php, then measure against fresh
+# worker pools.
 #
-# Per-mode pools for two reasons:
+# Why fresh pools, and why so many of them:
 #
 #   1. The control is only valid on a pool that has never served an OOM request.
-#   2. The producer induces heap corruption, and Zend's allocator answers with
-#      `zend_mm_heap corrupted` + abort(), which takes every worker down with it.
-#      The process dying is a property of the thing being measured, so a crash
-#      should cost one mode rather than the whole walkthrough. stage3.py reports
-#      it instead of tracebacking, and each mode gets a new server here.
+#   2. The producer induces real heap corruption, and Zend's allocator answers with
+#      `zend_mm_heap corrupted` + abort(), which takes every worker in the pool down
+#      with it. A pool tolerates only a handful of corrupting requests -- measured
+#      at about three -- before it dies.
+#   3. Discovery costs producers too: claim and leak have to sweep the value-size
+#      classes to find a shape that contains the stale pointer, because where it
+#      lands depends on the pool's accumulated history.
+#
+# So control and containment get one pool each (containment *is* the sweep), while
+# claim and leak get a fresh pool per rep. Running three reps inside one pool spent
+# the pool's tolerance on rep 0 and reported "server died" for the rest, which looks
+# exactly like the bug failing to reproduce.
+#
+# The process dying is a property of the thing being measured, not a fault in the
+# harness: stage3.py reports it instead of tracebacking.
 #
 # Exits non-zero unless: the control is clean, containment is found, a length claim
 # is adopted, AND an out-of-buffer read is confirmed.
@@ -30,7 +40,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --reps) REPS="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -76,38 +86,70 @@ stop_server() {
   SRV=""
 }
 
-CONTROL=""; CONTAINMENT=0; CLAIM=0; LEAK=0
-
-for mode in control containment claim leak; do
-  log="$LOGDIR/instr-$mode.log"
-  echo "======================================================================"
-  echo "=== mode: $mode"
-  echo "======================================================================"
+# one mode, one fresh pool; echoes stage3.py's output
+run_rep() {
+  # separate statements: under `set -u` a `local` that references a variable it is
+  # itself assigning in the same statement is not reliable.
+  local mode="$1"
+  local reps="$2"
+  local log="$LOGDIR/instr-$mode.log"
   start_server "$log"
-  out="$(python3 "$HERE/stage3.py" --port "$PORT" --log "$log" --reps "$REPS" "$mode" 2>&1)" || true
-  echo "$out"
+  local out
+  out="$(python3 "$HERE/stage3.py" --port "$PORT" --log "$log" --reps "$reps" "$mode" 2>&1)" || true
   stop_server
+  printf '%s\n' "$out"
+}
 
-  probes="$(grep -c "\[INSTR-" "$log" || true)"
-  echo "  ($probes probe lines in $log)"
-  case "$mode" in
-    control)     CONTROL="$(printf '%s\n' "$out" | grep -o 'RESULT control [A-Z]*' | awk '{print $3}' | tail -1)" ;;
-    containment) CONTAINMENT="$(printf '%s\n' "$out" | grep -o 'RESULT containment [0-9]*' | awk '{print $3}' | tail -1)" ;;
-    claim)       CLAIM="$(printf '%s\n' "$out" | grep -o 'RESULT claim [0-9]*' | awk '{print $3}' | tail -1)" ;;
-    leak)        LEAK="$(printf '%s\n' "$out" | grep -o 'RESULT leak [0-9]*' | awk '{print $3}' | tail -1)" ;;
-  esac
-  echo
-done
+result_of() {  # <stream> <mode> -> last RESULT value
+  printf '%s\n' "$1" | grep -o "RESULT $2 [A-Z0-9]*" | awk '{print $3}' | tail -1
+}
 
+echo "======================================================================"
+echo "=== mode: control  (one fresh pool, no producer)"
+echo "======================================================================"
+out="$(run_rep control 1)"
+printf '%s\n' "$out"
+CONTROL="$(result_of "$out" control)"
 CONTROL="${CONTROL:-UNKNOWN}"
+echo
+
+echo "======================================================================"
+echo "=== mode: containment  (one pool, sweeps every shape)"
+echo "======================================================================"
+out="$(run_rep containment "$REPS")"
+printf '%s\n' "$out"
+CONTAINMENT="$(result_of "$out" containment)"
 CONTAINMENT="${CONTAINMENT:-0}"
-CLAIM="${CLAIM:-0}"
-LEAK="${LEAK:-0}"
+echo
+
+CLAIM=0
+LEAK=0
+for mode in claim leak; do
+  echo "======================================================================"
+  echo "=== mode: $mode  (a fresh pool per rep -- a pool survives about three"
+  echo "===                  corrupting requests, and discovery spends some)"
+  echo "======================================================================"
+  total=0
+  rep=1
+  while [ "$rep" -le "$REPS" ]; do
+    echo "--- $mode, rep $rep (fresh pool)"
+    out="$(run_rep "$mode" 1)"
+    printf '%s\n' "$out"
+    n="$(result_of "$out" "$mode")"
+    total=$(( total + ${n:-0} ))
+    rep=$(( rep + 1 ))
+    echo
+  done
+  echo "  $mode: $total of $REPS reps on fresh pools"
+  echo "RESULT $mode $total"
+  echo
+  if [ "$mode" = "claim" ]; then CLAIM="$total"; else LEAK="$total"; fi
+done
 
 echo "======================================================================"
 echo "VERDICT"
 printf '  control clean (fresh pool, no producer) : %s\n' "$CONTROL"
-printf '  containment configs found               : %s\n' "$CONTAINMENT"
+printf '  containment shapes found                : %s\n' "$CONTAINMENT"
 printf '  length claims adopted (of %s reps)       : %s\n' "$REPS" "$CLAIM"
 printf '  out-of-buffer reads confirmed           : %s\n' "$LEAK"
 echo

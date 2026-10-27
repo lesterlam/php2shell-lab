@@ -230,7 +230,7 @@ def mode_containment(args):
 CONFIGS = [(73, 256), (73, 512), (73, 1024), (73, 4096), (16, 8192), (8, 16384)]
 
 
-def sweep_containment(args, reps=1, label="  "):
+def sweep_containment(args, reps=1, label="  ", first_only=False):
     """Which consumer shapes put PS(id)+0x10 inside a buffer we control?
 
     Shape discovery has to be redone per mode rather than assumed. The landing
@@ -241,6 +241,11 @@ def sweep_containment(args, reps=1, label="  "):
     nothing while containment mode was simultaneously reporting +0x138.
 
     Returns [(fields, vsize, offset), ...] for shapes whose containment is usable.
+
+    `first_only` stops at the first usable shape. Every config costs a producer, and
+    each producer corrupts the heap a little more, so a caller that needs one shape
+    (claim, leak) must not walk all six -- doing so killed the pool before the
+    measurement ran, which looked exactly like the bug not reproducing.
     """
     hits = []
     for fields, vsize in CONFIGS:
@@ -262,6 +267,8 @@ def sweep_containment(args, reps=1, label="  "):
                     hits.append((fields, vsize, off))
                     print("%s%-7d %-9d len field inside a %d-byte buffer at +0x%x"
                           % (label, fields, vsize, length, off))
+                    if first_only:
+                        return hits
                     break
     return hits
 
@@ -276,7 +283,7 @@ def stamp_band(off):
 def mode_claim(args):
     print("### claim -- write a length into the contained buffer, see if it is adopted")
     print()
-    hits = sweep_containment(args, reps=1)
+    hits = sweep_containment(args, reps=1, first_only=True)
     if not hits:
         print("  could not place PS(id)+0x10 inside a controlled buffer on this pool,")
         print("  so there is nothing to aim at and no claim can be adopted here.")
@@ -324,7 +331,7 @@ def mode_leak(args):
     print("  Closed with one inequality: every leaked pointer must lie beyond the end of")
     print("  the buffer the read started in.")
     print()
-    hits = sweep_containment(args, reps=1)
+    hits = sweep_containment(args, reps=1, first_only=True)
     if not hits:
         print("  could not place PS(id)+0x10 inside a controlled buffer on this pool,")
         print("  so there is nothing to aim at and no over-read to confirm here.")
