@@ -30,6 +30,9 @@ jobs:
           path: runtimes
           key: php-runtimes-8.4.26-8.4.27-v1
 
+      - name: Make scripts executable
+        run: chmod +x ./*.sh
+
       - name: Fetch PHP runtimes
         run: |
           ./fetch-php.sh 8.4.26
@@ -69,4 +72,47 @@ jobs:
           path: |
             verify-output.txt
             demo-output.txt
+          if-no-files-found: warn
+
+  stage2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Make scripts executable
+        run: chmod +x ./*.sh
+
+      - name: Cache Alpine PHP runtimes
+        uses: actions/cache@v4
+        with:
+          path: runtimes
+          key: php-runtimes-alpine-8.4.26-8.4.27-v1
+
+      - name: Fetch Alpine PHP runtimes
+        run: |
+          ./fetch-php.sh 8.4.26 fpm-alpine3.23
+          ./fetch-php.sh 8.4.27 fpm-alpine3.23
+
+      - name: Gate -- stale state after OOM, vulnerable vs patched
+        run: ./verify-stage2.sh | tee stage2-output.txt
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## Stage 2 -- what the OOM leaves behind"
+            echo
+            echo '```'
+            cat stage2-output.txt 2>/dev/null || echo "(gate did not run)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage2-output
+          path: stage2-output.txt
           if-no-files-found: warn

@@ -16,7 +16,7 @@ records, the PHP security advisories and the source diff between PHP 8.4.26 and
 | Published | 2026-10-21 |
 | Advisories | GHSA-w8hw-w9fx-j79w, GHSA-6wmf-4rv5-p3rp |
 | Fixed in | 8.2.35, 8.3.36, 8.4.27, 8.5.12 |
-| Fix commit | `506e87fa` — "Avoid state corruption via bailout" |
+| Fix commit | `506e87fa` — "Avoid state corruption via bailout" (8.4 branch; verified ancestor of tag `php-8.4.27`). The same change also lands as `3584a98bda` on another branch. |
 | Reported by | Ryan (Calif.io), Wiz, OpenAI |
 | Remediation | Arnaud Le Blanc, Ilija Tovilo, Jakub Zelenka, Nora Dossche |
 
@@ -139,11 +139,185 @@ With `php -S` (cli-server), `memory_limit=64M`, `post_max_size=256M`:
   reports an inflated peak (34 MiB, decaying to 18 MiB against a 2 MiB baseline)
   — evidence that the aborted request left state on the worker.
 
-## 6. Limitations of this reproduction
+## 6. Stage 2 — what the OOM leaves behind (measured)
 
-What is demonstrated is the pre-condition and the vulnerable/patched delta, plus
-the root cause from the source diff. What is **not** demonstrated is the
-weaponised RCE. Reaching control-flow hijack additionally requires:
+Section 5 shows the aborted request leaves *something* on the worker, measured
+indirectly (an inflated peak on the next request). This section measures it
+directly: what the next request actually receives.
+
+### 6.1 The channel
+
+Session upload progress is the confirmed consumer from section 3, and it runs
+during **request startup — before RINIT**, so no application code is involved.
+Three details make it observable from outside:
+
+- PHP accepts the session id from a **form field named after `session.name`**
+  (`PHPSESSID`) inside the multipart body, not only from a cookie.
+- When PHP starts a session it **echoes the session id back in `Set-Cookie`**.
+- A session id that fails PHP's character check still produces the header, plus
+  a warning.
+
+So if the session id is read out of recycled memory, the response itself carries
+the result. The observable is the length and content of the
+`Set-Cookie: PHPSESSID=...` value. A healthy worker returns 32 characters.
+
+### 6.2 Ground truth in the patch
+
+The fix commit is explicit about the ordering hazard. In `ext/session/session.c`:
+
+```c
+case MULTIPART_EVENT_START: {
+    multipart_event_start *data = (multipart_event_start *) event_data;
+
+    /* This runs before RINIT, so we need to clear these early */
+    php_rinit_session_globals();
+```
+
+Before the fix those globals were **not** cleared at that point, so the handler
+ran with the previous request's session globals still live. The commit also adds
+a `PS(in_rfc1867_update)` flag so the decode/encode performed here resolves no
+classes, and deletes `$_SESSION` afterwards:
+
+```c
+/* $_SESSION was populated in incomplete_classes_only mode */
+zend_string *session_var_name = ZSTR_INIT_LITERAL("_SESSION", 0);
+zend_delete_global_variable(session_var_name);
+```
+
+The regression test added for this path, `ext/session/tests/rfc1867_no_user_code.phpt`,
+is this attack's skeleton — a multipart POST carrying a `PHPSESSID` **form field**
+next to `PHP_SESSION_UPLOAD_PROGRESS` — and its own comment states the consequence:
+
+> "This script has not called `session_start()`, so it must not be left behind:
+> it would otherwise expose the session data of whatever id the request body
+> carried."
+
+The sibling test `rfc1867_sid_invalid.phpt` asserts the exact warning this lab
+observes:
+
+```
+Warning: PHP Request Startup: Session ID is too long or contains illegal
+characters. Only the A-Z, a-z, 0-9, "-", and "," characters are allowed in
+Unknown on line 0
+```
+
+`PHP Request Startup` is the tell: the session id is being read before the
+request's own code exists.
+
+### 6.3 Measured
+
+Builds: `php:8.4.26-fpm-alpine3.23` and `php:8.4.27-fpm-alpine3.23` — the image
+family the public proof of concept was calibrated against — both run as `php -S`
+with `PHP_CLI_SERVER_WORKERS=4` and the default `memory_limit=128M`.
+
+| mode | PHP 8.4.26 (vulnerable) | PHP 8.4.27 (patched) |
+|---|---|---|
+| `fresh` — consumer only, worker never OOM'd | 32-byte ids, 0 fatals (8/8) | 32-byte ids, 0 fatals (8/8) |
+| `after` — OOM producer, then consumer (code geometry) | **18–20 of 20 anomalous**: 8-byte ids `0100000000000000`, startup warning in the same runs | producer does not OOM (0/20); every id 32 bytes |
+| `after` (heap geometry) | **10/10 anomalous**: mostly corrupted-allocation deaths (7–10 of 10), occasionally a stale id instead | — |
+
+The `fresh` row is the control that makes the rest mean something: without a
+preceding OOM, the same request shapes are completely clean.
+
+Counts vary between runs — which worker picks up which request is not fully under
+the client's control. The *shape* of the result is stable; the exact tally is not,
+so a single run is not evidence of a rate. Read these as "nearly always" and
+"usually", not as constants.
+
+Anomalous id, as it appears on the wire:
+
+```
+Set-Cookie: PHPSESSID=%01%00%00%00%00%00%00%00; path=/
+Warning: PHP Request Startup: Session ID is too long or contains illegal characters...
+```
+
+Corrupted allocation (heap pairing):
+
+```
+Fatal error: Possible integer overflow in memory allocation (3 * 18446744073709551615 + 32)
+Fatal error: Allowed memory size ... (tried to allocate 17361641481138401552 bytes)
+```
+
+The second value is `0xF0F0F0F0F0F0F0F0`; the first is `3 * SIZE_MAX + 32`. Both
+are allocation sizes taken from memory the aborted request left behind — a
+memory-safety failure, not merely a denial of service.
+
+### 6.4 The emitted length tracks attacker input
+
+Sweeping the consumer's filler value size (code geometry):
+
+| filler value size | emitted `PHPSESSID` length |
+|---|---|
+| 16 | 16 |
+| 96 | 96 |
+| 256 | 256 |
+| 512 | 512 |
+| 32, 48, 64, 192 | request dies before the header is written |
+
+The session id's **length field** therefore comes from memory this request
+recycled, and the bytes are this request's own filler. The primitive is present —
+PHP will emit an attacker-influenced number of bytes from a recycled buffer — but
+on this layout the read stays inside a buffer the attacker supplied.
+
+### 6.5 The pairing decides which symptom appears
+
+The same two bugs, on the same worker, produce two different outcomes depending
+on which producer geometry precedes the consumer — predominantly, not as a clean
+switch:
+
+- **code geometry** (251,557-byte producer) → almost always a session id read
+  from recycled memory, with the startup warning;
+- **heap geometry** (249,042-byte producer) → usually the follow-up request dies
+  on an allocation size taken from stale memory, with no id emitted; a stale id
+  still appears in some runs.
+
+Both are stale-state consequences. This is also the honest explanation for why
+the public PoC's offsets look arbitrary: they are one point in a pairing space,
+not universal constants.
+
+### 6.6 What did not reproduce
+
+Three claims from the public proof of concept did not hold here, and are recorded
+rather than smoothed over:
+
+1. **Pipelining.** Its leak batches send one producer plus eight consumers down a
+   single connection. On this build `php -S` returns **zero responses** for any
+   pipelined batch — including two pipelined `GET`s, and a batch whose producer
+   does not OOM at all. The consumers therefore cannot ride the poisoned
+   connection; this lab reaches the same primitive on separate connections
+   instead. The public run was behind nginx and never captured its own wire
+   traffic, so this is a statement about this lab's clean CLI-server setup, not
+   about the live run.
+2. **The 256-byte over-read with a foreign tail.** The PoC's heap-stage consumer
+   stamps a length (256) into a 79-byte field so the claimed length exceeds the
+   real buffer. That shape never landed here: 100/100 attempts returned ordinary
+   32-byte ids.
+3. **The 16-byte code cookie** whose first eight bytes are `16` and whose low 21
+   bits fingerprint `zval_ptr_dtor` was not observed.
+
+### 6.7 Provenance
+
+The request shapes used here are adapted from the public proof of concept for the
+*Steal My Bitcoin* challenge (`KillaBoi/StealMyBitcoin-PoC`), which declares no
+licence — so this is an independent implementation of the technique and its
+measured geometry, not a copy of its code. The two producer bodies this lab
+builds are **249,042** and **251,557** bytes, matching the figures that PoC
+documents for the same image family, which is what keeps the comparison
+like-for-like.
+
+### 6.8 Ceiling
+
+Command execution still needs the length/buffer decoupling from 6.6(2), then a
+code-pointer leak to defeat ASLR, then a forged structure that request cleanup
+will call. This lab demonstrates the stale-state primitive and a corrupted
+allocation size, with a clean vulnerable/patched A/B — and stops there.
+
+## 7. Limitations of this reproduction
+
+What is demonstrated is the pre-condition, the vulnerable/patched delta, the
+root cause from the source diff, and the stale-state consequences measured in
+section 6. What is **not** demonstrated is the weaponised RCE. Reaching
+control-flow hijack additionally requires:
 
 1. Controlling the *content*, *location* and *timing* of the corrupted memory
    (heap grooming against both glibc malloc and Zend's own allocator).
@@ -152,10 +326,13 @@ weaponised RCE. Reaching control-flow hijack additionally requires:
 3. Bypassing NX (ROP), stack canaries and CET/shadow stack.
 4. Doing all of the above reliably across a multi-worker prefork pool.
 
-There is no public proof-of-concept. This lab, and the honest ceiling on what it
-can show, stop at the boundary above.
+A public proof of concept does exist — see section 6.5 and 6.7. What this lab
+takes from it is the stale-state primitive; what it does not take is the command
+execution, which needs the decoupling and the leak listed above. Section 6.6
+records the parts of that PoC that did not reproduce here, because a negative
+result dated to this build is more useful than an assumed one.
 
-## 7. Mitigation
+## 8. Mitigation
 
 1. **Patch** to 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12. This is the only complete fix.
 2. If patching is impossible: set and enforce `memory_limit=-1` administratively,

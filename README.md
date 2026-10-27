@@ -7,9 +7,11 @@
 
 ![PHP2Shell trigger-condition visualiser](assets/screenshot.png)
 
-A minimal, dependency-light lab that reproduces the **trigger condition** behind
+A minimal, dependency-light lab that reproduces two things behind
 CVE-2026-109618 / CVE-2026-109619 — the October 2026 PHP core remote code
-execution disclosed as "PHP2Shell" (CVSS 4.0 **9.2**).
+execution disclosed as "PHP2Shell" (CVSS 4.0 **9.2**): the **trigger condition**
+(stage 1) and the **stale session state the OOM leaves for the next request**
+(stage 2).
 
 The lab shows that a single unauthenticated HTTP request can exhaust PHP's
 `memory_limit` while remaining far inside `post_max_size`, **during request
@@ -21,7 +23,7 @@ security team describes as reachable to RCE on Apache `mod_php`.
 | | |
 |---|---|
 | ✅ Demonstrates | The unauthenticated OOM pre-condition, that it occurs before application code, and the behavioural difference between vulnerable and patched builds. |
-| ❌ Does not demonstrate | A weaponised exploit. **No public proof-of-concept exists.** Turning the resulting invalid memory state into control-flow hijack additionally requires a specific allocator layout, heap grooming and a producer/consumer pair across requests. |
+| ❌ Does not demonstrate | A weaponised exploit. A public proof of concept does exist (see [Stage 2](#stage-2--what-the-oom-leaves-behind)); this lab reproduces its **stale-state primitive**, not its command execution. Reaching control-flow hijack additionally requires decoupling the emitted length from the buffer it reads, a code-pointer leak to defeat ASLR, and a forged structure that request cleanup will call. |
 
 This is an educational / defensive-research artefact. Everything runs on
 `127.0.0.1`. Do not point it at systems you do not own.
@@ -54,6 +56,64 @@ A 5 MB payload — under **2 % of `post_max_size`** — already exhausts a 64 MB
 ~17× amplification that is roughly **4.2 GiB of request memory, about 68× the
 memory limit**. The patched build does not merely fail gracefully; it stops
 retaining attacker-controlled part headers entirely.
+
+## Stage 2 — what the OOM leaves behind
+
+Stage 1 shows a request dying before application code runs. Stage 2 asks what the
+**next** request on that worker receives.
+
+Session upload progress runs during request startup, before any application code,
+and PHP echoes the session id back in `Set-Cookie`. If that id is read out of
+recycled memory, the response itself carries the result.
+
+Measured on the image family the public proof of concept was calibrated against
+(`php:8.4.26-fpm-alpine3.23` / `8.4.27-fpm-alpine3.23`, `php -S`, 4 workers):
+
+| mode | 8.4.26 (vulnerable) | 8.4.27 (patched) |
+|---|---|---|
+| `fresh` — worker never OOM'd | 32-byte ids, 0 fatals | 32-byte ids, 0 fatals |
+| `after` — OOM producer, then consumer | **18–20 of 20 anomalous** — 8-byte stale id + startup warning | producer does not OOM; every id 32 bytes |
+| `after` (heap pairing) | **10/10 anomalous** — usually a corrupted allocation size | — |
+
+```
+fresh worker : PHPSESSID=7008ad13f65794ab4624eacca122d8b4    (32 bytes)
+after OOM    : PHPSESSID=%01%00%00%00%00%00%00%00            (stale memory)
+               Warning: PHP Request Startup: Session ID is too long or
+               contains illegal characters...
+```
+
+The emitted length also follows attacker input: a 96-byte filler yields a 96-byte
+id, 256 yields 256, 512 yields 512.
+
+Counts vary between runs — which worker takes which request is not fully under the
+client's control. The shape of the result is stable; the tally is not.
+
+[`docs/ANALYSIS.md` §6](docs/ANALYSIS.md) carries the patch ground truth, the
+pairing effect, and the three claims from that PoC which did **not** reproduce
+here.
+
+Before trusting a 32-byte id, check that the path is reachable at all:
+`GET /diag.php` prints the SAPI and the settings the upload-progress callback
+depends on. On a build where that callback is not wired up, every request
+returns no cookie at all — indistinguishable from "the bug did not reproduce".
+
+```bash
+./fetch-php.sh 8.4.26 fpm-alpine3.23
+./fetch-php.sh 8.4.27 fpm-alpine3.23
+
+# control: a worker that has never been OOM'd
+./phpv.sh 8.4.26-fpm-alpine3.23 -d memory_limit=128M -S 127.0.0.1:8426 -t www &
+python3 stage2.py --port 8426 fresh --reps 8
+
+# the same shapes after one OOM producer
+python3 stage2.py --port 8426 after --reps 20
+python3 stage2.py --port 8426 after --reps 10 --producer heap
+python3 stage2.py --port 8426 sweep
+```
+
+Note that `php -S` is started with `PHP_CLI_SERVER_WORKERS=4` for these results;
+the stale state lives in a worker process, so a single-worker server changes the
+timing even though it does not remove the bug.
 
 ## Quickstart
 
@@ -109,15 +169,17 @@ retaining unbounded attacker-controlled headers. See
 ```
 fetch-php.sh        pull + extract a PHP image via the Registry API (no daemon)
 phpv.sh             run an extracted PHP with its own dynamic loader
-probe.py            crafted multipart body + verdict
+probe.py            stage 1: crafted multipart body + verdict
+stage2.py           stage 2: fresh / after / sweep / abort / forged
 demo.sh             one-command A/B walkthrough
 verify.sh           non-interactive gate (asserts vulnerable != patched)
-www/                minimal probe endpoints
+www/                probe endpoints (index.php, upload.php, diag.php)
 docs/ANALYSIS.md    root-cause and patch analysis
 docs/index.html     interactive visualiser (GitHub Pages)
 assets/             README screenshot
 .github/workflows/  CI: fetches runtimes and runs the gate
-runtimes/           downloaded PHP builds (gitignored)
+runtimes/           downloaded PHP builds, one dir per image variant
+                    (gitignored; ~1.1 GB each)
 ```
 
 ## References
