@@ -23,7 +23,7 @@ security team describes as reachable to RCE on Apache `mod_php`.
 | | |
 |---|---|
 | ✅ Demonstrates | The unauthenticated OOM pre-condition, that it occurs before application code, and the behavioural difference between vulnerable and patched builds. |
-| ❌ Does not demonstrate | A weaponised exploit. A public proof of concept does exist (see [Stage 2](#stage-2--what-the-oom-leaves-behind)); this lab reproduces its **stale-state primitive**, not its command execution. Reaching control-flow hijack additionally requires decoupling the emitted length from the buffer it reads, a code-pointer leak to defeat ASLR, and a forged structure that request cleanup will call. |
+| ❌ Does not demonstrate | A weaponised exploit. A public proof of concept does exist; this lab reproduces its **stale-state primitive** and the **over-read that follows from it** (see [Stage 3](#stage-3--decoupling-the-length-from-the-buffer)), not its command execution. RCE from here needs a code-pointer leak to defeat ASLR and a forged structure that request cleanup will call. |
 
 This is an educational / defensive-research artefact. Everything runs on
 `127.0.0.1`. Do not point it at systems you do not own.
@@ -83,7 +83,9 @@ after OOM    : PHPSESSID=%01%00%00%00%00%00%00%00            (stale memory)
 ```
 
 The emitted length also follows attacker input: a 96-byte filler yields a 96-byte
-id, 256 yields 256, 512 yields 512.
+id, 256 yields 256, 512 yields 512 — but at these sizes the read stays inside the
+buffer you supplied, because the allocation is too small to contain the stale
+pointer. Stage 3 breaks that limit.
 
 Counts vary between runs — which worker takes which request is not fully under the
 client's control. The shape of the result is stable; the tally is not.
@@ -91,6 +93,46 @@ client's control. The shape of the result is stable; the tally is not.
 [`docs/ANALYSIS.md` §6](docs/ANALYSIS.md) carries the patch ground truth, the
 pairing effect, and the three claims from that PoC which did **not** reproduce
 here.
+
+## Stage 3 — decoupling the length from the buffer
+
+Stage 2 left one question open, and it is an address question, not a payload one.
+The emitted length is a `zend_string` **struct field**, so whether PHP reads a
+truthful length depends on *where the stale pointer lands*:
+
+```
+PS(id)+0x10   the len field PHP will trust
+PS(id)+0x18   the bytes it will read from
+```
+
+Land at the **start** of a buffer you control and `+0x10` is that buffer's own
+header — a truthful length, read staying inside your allocation. Land **inside** it
+at offset ≥ `0x18` and `+0x10` is your bytes.
+
+Neither case is visible from the wire, so the lab ships an instrumented build: three
+`fprintf()`s, no behaviour change.
+
+```bash
+./build-instrumented.sh    # php 8.4.26 + three address probes
+PORT=18627 ./stage3.sh     # fresh pool: control -> containment -> claim -> leak
+```
+
+Measured on that build (vulnerable 8.4.26, `php -S`, 4 workers):
+
+| question | measurement |
+|---|---|
+| does the stale pointer land inside a buffer we control? | **yes** — a 1024-byte value contains it (at `+0x278` in one run, `+0x128` in another: the offset moves, the containment does not), 4096 B at `+0x78`, 8192 B at `+0x78`. A 256-byte value does not, which is exactly why Stage 2's sweep never left the buffer |
+| is the emitted length ours to choose? | **yes** — claiming `0x1234` produced a **4660-byte** session id, 4 of 4 runs |
+| is the tail memory we did not write? | **yes** — marker bytes from *other* allocations appear in the output, plus nine heap-like `u64`s spaced `0x40` apart |
+
+The last one is closed with one inequality rather than an eyeball: the read began in
+a 1024-byte buffer at `V`, so it ends at `V+0x400`, and every leaked pointer lies
+beyond that address. Masking one to Zend's 2 MiB alignment gives the allocator's
+chunk base — the input the next chain steps need.
+
+[`docs/ANALYSIS.md` §7](docs/ANALYSIS.md) carries the method and the raw numbers.
+This is chain step 3 of 6: no code pointer, no forged structure, no control-flow
+change.
 
 Before trusting a 32-byte id, check that the path is reachable at all:
 `GET /diag.php` prints the SAPI and the settings the upload-progress callback
@@ -171,6 +213,10 @@ fetch-php.sh        pull + extract a PHP image via the Registry API (no daemon)
 phpv.sh             run an extracted PHP with its own dynamic loader
 probe.py            stage 1: crafted multipart body + verdict
 stage2.py           stage 2: fresh / after / sweep / abort / forged
+stage3.py           stage 3: containment / claim / leak measurement
+stage3.sh           one-command stage 3 walkthrough (fresh worker pool)
+build-instrumented.sh build php 8.4.26 + the three address probes
+instrument-php.py   the probe patches themselves (anchored insertion)
 demo.sh             one-command A/B walkthrough
 verify.sh           non-interactive gate (asserts vulnerable != patched)
 www/                probe endpoints (index.php, upload.php, diag.php)

@@ -257,7 +257,14 @@ Sweeping the consumer's filler value size (code geometry):
 The session id's **length field** therefore comes from memory this request
 recycled, and the bytes are this request's own filler. The primitive is present —
 PHP will emit an attacker-influenced number of bytes from a recycled buffer — but
-on this layout the read stays inside a buffer the attacker supplied.
+at these field sizes the read stays inside a buffer the attacker supplied.
+
+> **Corrected 28 Oct 2026.** The clause above — *"the read stays inside a buffer
+> the attacker supplied"* — is true of the shapes measured here (64–512-byte
+> fields) and **false in general**. Growing the value until a single allocation
+> *contains* the stale pointer decouples the emitted length from the buffer it is
+> read from, and the read continues into memory this request never wrote. **§7**
+> supersedes this subsection's ceiling; the sweep table above is left as measured.
 
 ### 6.5 The pairing decides which symptom appears
 
@@ -312,15 +319,189 @@ code-pointer leak to defeat ASLR, then a forged structure that request cleanup
 will call. This lab demonstrates the stale-state primitive and a corrupted
 allocation size, with a clean vulnerable/patched A/B — and stops there.
 
-## 7. Limitations of this reproduction
+> **Corrected 28 Oct 2026.** The first of those three prerequisites — the
+> length/buffer decoupling — is now demonstrated in **§7**. The ceiling for RCE as
+> a whole is unchanged: §7 adds a disclosed over-read carrying heap pointers, not a
+> code pointer or a forged structure.
+
+## 7. Stage 3 — decoupling the length from the buffer (measured)
+
+Section 6.4 left a ceiling in place: at every size measured there, the read stayed
+inside a buffer the attacker had supplied. That ceiling was an artefact of the
+*sizes tested*, not of the bug. This records what lifted it.
+
+### 7.1 The question is an address, not a payload
+
+The emitted length is not a value the attacker sets — it is a **struct field of a
+`zend_string`**, read from wherever the stale pointer happens to point:
+
+```
+PS(id)+0x00  gc(refcount)  reference count + type
+PS(id)+0x08  h             hash
+PS(id)+0x10  len  <-- the length PHP will trust
+PS(id)+0x18  val[1]        first byte of the string body
+```
+
+The length is *truthful* exactly when `PS(id)` lands at the **start** of a buffer we
+control: `+0x10` is then that buffer's own header, written by PHP consistently with
+its allocation size. It becomes a lie when `PS(id)` lands **inside** our buffer at
+offset ≥ 0x18, because then `+0x10` is bytes we chose.
+
+Neither case is visible from the wire — both can emit the same bytes. It has to be
+measured from inside the process, which is why this stage needs a modified build.
+
+### 7.2 Method: instrument rather than guess
+
+`build-instrumented.sh` builds stock php 8.4.26 with three `fprintf()`s added by
+`instrument-php.py`. The probes only observe; behaviour is unmodified.
+
+| probe | site | prints |
+|---|---|---|
+| A | `php_session_send_cookie()`, before the id is URL-encoded | `PS(id)`, `ZSTR_VAL`, `ZSTR_LEN`, the header, the first bytes |
+| B | rfc1867 `MULTIPART_EVENT_START` | `PS(id)` as the upload-progress path sees it |
+| C | `php_register_variable_ex()` | address and length of every controlled POST value |
+
+A and C together give the delta between the stale pointer and our own buffers —
+the number the entire grooming problem reduces to, and one that cannot be read off
+the wire. The release tarball ships a pre-generated `configure` and pre-generated
+parsers, so this builds with only a C compiler and make: no autoconf, bison, re2c.
+
+### 7.3 Measured: containment
+
+Producer = the `code` geometry (251,557 bytes on the wire), then the consumer on a
+following connection. `php -S`, 4 workers, vulnerable 8.4.26:
+
+| consumer fields × value size | `PS(id)` | containment |
+|---|---|---|
+| 73 × 256 B | `0x72213927e080` | none — lands at a buffer **header** |
+| 73 × 512 B | `0x72213927e080` | none |
+| 73 × 1024 B | `0x72213927e080` | **inside** a 1024-byte buffer at `+0x278` |
+| 73 × 4096 B | `0x72213927e080` | **inside** a 4096-byte buffer at `+0x78` |
+| 16 × 8192 B | `0x72213927e080` | **inside** an 8192-byte buffer at `+0x78` |
+| 8 × 16384 B | `0x72213927e080` | **inside** a 16384-byte buffer at `+0x2078` |
+
+Two things to read from that. `PS(id)` is **identical across every shape within a
+run** — the stale pointer's address is a property of the previous request, not of the
+consumer, so it is knowable. And containment appears only once the value is large
+enough for one allocation to *span* that address: it needs a buffer that contains
+`PS(id)`, not a buffer that starts at it.
+
+That also explains all of §6.4. A 64–512-byte allocation is too small to reach the
+stale address, so PHP kept reading its own header — which is exactly why the
+emitted length always equalled the filler size.
+
+> **The offset is not stable — only the address is.** A later run measured the same
+> 1024-byte containment at `+0x128`, with `PS(id) = 0x7ad01a67d040`, not `+0x278`.
+> The allocator's history differs between runs, so *which* offset inside the region
+> the stale pointer lands on moves. Hardcoding the band `[0x270, 0x2a0)` — as an
+> earlier revision of this lab did — therefore produced zero adoptions, which is why
+> §7.4 scouts the offset at runtime instead of assuming it. Read the offsets above as
+> *one* run's values, and the *containment* as the finding, not the number.
+
+### 7.4 Measured: the length becomes ours
+
+Because the offset moves between runs (§7.3), a constant cannot aim at it. So
+`stage3.py` sends one **scout** request first — a producer plus a plain `P`-filled
+consumer whose only job is to be measured — reads the offset out of probe C, and
+only then builds the payload that stamps `0x1234` at every 8-aligned offset across a
+window around that measured offset. Any 8-aligned read inside the window yields the
+claim. From the run that gates CI:
+
+```
+scout: PS(id)=0x7ad01a67d040 is inside a 1024-byte buffer at +0x128;
+       the len field PHP will read is at +0x138 of the value
+stamping 0x1234 at every 8-aligned offset in [0x128, 0x150) of a 1024-byte value
+
+rep    id len     verdict
+0      4660       *** length adopted our claim ***
+1      4660       *** length adopted our claim ***
+2      4660       *** length adopted our claim ***
+```
+
+4660 = `0x1234`. The length is now decoupled from the buffer it is read from.
+
+### 7.5 Measured: the tail is memory we did not write
+
+A long id full of one's own filler proves nothing — "my other allocations" and
+"foreign heap" look identical. Two tells that survive it, then one inequality.
+
+**Tell 1 — per-field markers.** Fill field *i* with byte `0x40+i`; a read crossing
+allocation boundaries mixes their markers. Measured output alternates runs of
+`0x40` (field 0) with runs of `0x50` (field 16) at regular strides:
+
+```
++0x0020   352 bytes of 0x40
++0x0284   620 bytes of 0x50
++0x0520   352 bytes of 0x40
+```
+
+**Tell 2 — address-like u64.** Real heap structures hold `0x7…` values that filler
+never produces. Nine found, spaced `0x40` apart — a HashTable bucket array:
+
+```
++0x01a8 = 0x72213927e280
++0x01e8 = 0x72213927e2c0
++0x0228 = 0x72213927e300
++0x06a8 = 0x72213927e780
+```
+
+**The inequality.** The read started in a buffer at `0x72213927de18`, length 1024, so
+it ends at `0x72213927e218`. Every leaked pointer lies **beyond** that address. That
+comparison is the proof: the bytes are not ours, because they are outside the
+allocation they were read from. Masking one to Zend's 2 MiB chunk alignment gives
+the chunk base — the input the next two chain steps need:
+
+```
+0x72213927e280 & ~0x1FFFFF = 0x722139200000
+```
+
+### 7.6 What this does and does not establish
+
+Establishes:
+
+- the stale pointer lands inside a buffer the attacker controls, repeatably, at an
+  address that is stable across consumer shapes;
+- the emitted length is attacker-chosen and the read continues past the end of that
+  allocation;
+- the tail contains live heap pointers, from which the allocator's chunk base
+  follows.
+
+Does **not** establish:
+
+- **no code pointer.** The leaked values are heap addresses of strings and HashTable
+  buckets. Defeating PIE needs a value in the text or library range, which would
+  need a different object type at the stale address.
+- **no forged structure.** The end state is a disclosed id, not a corrupted object
+  that request cleanup will call.
+- **no control-flow change**, and nothing beyond a single worker. Multi-worker
+  reliability is untouched.
+
+This is chain step 3 of 6. It closes the gap §6.4 recorded; it does not close the
+exploit.
+
+### 7.7 Reproducing
+
+```bash
+./build-instrumented.sh    # php 8.4.26 + probes A/B/C
+PORT=18627 ./stage3.sh     # fresh pool: control -> containment -> claim -> leak
+```
+
+`stage3.sh` starts its own server because the control is only valid on a pool that
+has never served an OOM request. Reusing a pool would show a stale `PS(id)` with no
+producer in flight, and `stage3.py` reports that instead of presenting it as a
+control.
+
+## 8. Limitations of this reproduction
 
 What is demonstrated is the pre-condition, the vulnerable/patched delta, the
-root cause from the source diff, and the stale-state consequences measured in
-section 6. What is **not** demonstrated is the weaponised RCE. Reaching
-control-flow hijack additionally requires:
+root cause from the source diff, the stale-state consequences measured in
+section 6, and the over-read measured in section 7. What is **not** demonstrated
+is the weaponised RCE. Reaching control-flow hijack additionally requires:
 
-1. Controlling the *content*, *location* and *timing* of the corrupted memory
-   (heap grooming against both glibc malloc and Zend's own allocator).
+1. ~~Controlling the *content*, *location* and *timing* of the corrupted memory.~~
+   **Demonstrated in §7** for the read path — but only on Zend's allocator and a
+   single worker. Remaining: the same control over a structure that is *written*,
+   and the glibc `malloc` pairing.
 2. A value that is used as a pointer, length or index rather than merely read —
    plus an information leak to defeat ASLR/PIE.
 3. Bypassing NX (ROP), stack canaries and CET/shadow stack.
@@ -328,11 +509,12 @@ control-flow hijack additionally requires:
 
 A public proof of concept does exist — see section 6.5 and 6.7. What this lab
 takes from it is the stale-state primitive; what it does not take is the command
-execution, which needs the decoupling and the leak listed above. Section 6.6
+execution, which needs the code-pointer leak listed above (the decoupling is in
+§7). Section 6.6
 records the parts of that PoC that did not reproduce here, because a negative
 result dated to this build is more useful than an assumed one.
 
-## 8. Mitigation
+## 9. Mitigation
 
 1. **Patch** to 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12. This is the only complete fix.
 2. If patching is impossible: set and enforce `memory_limit=-1` administratively,

@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>PHP2Shell — lab visualiser (trigger condition + stale state)</title>
-<meta name="description" content="Interactive visualiser of measured memory behaviour and stale-state disclosure for CVE-2026-109618 / CVE-2026-109619 (PHP2Shell).">
+<title>PHP2Shell — lab visualiser (trigger condition, stale state, over-read)</title>
+<meta name="description" content="Interactive visualiser of measured memory behaviour, stale-state disclosure and an attacker-controlled over-read for CVE-2026-109618 / CVE-2026-109619 (PHP2Shell).">
 <style>
   :root{
     --bg:#0d1117; --panel:#161b22; --panel2:#1c2230; --line:#2a3240;
@@ -214,11 +214,45 @@
     </table>
 
     <p style="color:var(--muted);font-size:12.5px;margin:14px 0 0">
-      So the id's <em>length field</em> comes from memory the request recycled, and the bytes are the
-      request's own filler — the read has not yet been pushed past that buffer, which is the step the
-      public proof of concept adds. Recorded negatives: that PoC's pipelining (this CLI server returns
-      zero responses for any pipelined batch), its 256-byte over-read and its 16-byte code cookie did
-      not reproduce here. Counts vary between runs; the shape of the result is stable, the tally is not.
+      So the id's <em>length field</em> comes from memory the request recycled, and at these field sizes
+      the bytes are the request's own filler.
+      <strong>Superseded 28 Oct 2026:</strong> growing the value until a single allocation
+      <em>contains</em> the stale pointer decouples the length from the buffer it is read from — an
+      instrumented build measured a 4660-byte id from an attacker-chosen length, with live heap pointers
+      in the tail. See the Stage 3 card below. Recorded negatives: that PoC's pipelining (this CLI server
+      returns zero responses for any pipelined batch), its 256-byte over-read and its 16-byte code cookie
+      did not reproduce here. Counts vary between runs; the shape of the result is stable, the tally is
+      not.
+    </p>
+  </div>
+
+  <div class="card" style="margin-top:18px">
+    <h2>Stage 3 — decoupling the length from the buffer</h2>
+    <p style="color:var(--muted);font-size:13.5px;margin:0 0 16px">
+      The emitted length is a <code>zend_string</code> <strong>struct field</strong>, so whether PHP reads
+      a truthful length depends on <em>where</em> the stale pointer lands — not on what the payload
+      contains. <code>PS(id)+0x10</code> is the length PHP will trust; <code>+0x18</code> is where it
+      reads bytes from. Land at the <em>start</em> of a buffer you control and the length is truthful;
+      land <em>inside</em> it at offset ≥ <code>0x18</code> and the length is yours. Neither is visible
+      from the wire, so this was measured from inside the process with an instrumented build.
+    </p>
+    <table>
+      <thead><tr><th>Question</th><th>Measurement</th></tr></thead>
+      <tbody>
+        <tr><td>Does the stale pointer land inside a buffer we control?</td>
+            <td><strong>Yes</strong> — a 1024-byte value contains it (at <code>+0x278</code> in one run, <code>+0x128</code> in another: the offset moves, the containment does not), 4096 B at <code>+0x78</code>, 8192 B at <code>+0x78</code>. A 256-byte value does not, which is why the Stage 2 sweep never left its own buffer. <code>stage3.py</code> scouts the offset at runtime rather than assuming it.</td></tr>
+        <tr><td>Is the emitted length ours to choose?</td>
+            <td><strong>Yes</strong> — claiming <code>0x1234</code> produced a <strong>4660-byte</strong> session id, 4 of 4 runs.</td></tr>
+        <tr><td>Is the tail memory we did not write?</td>
+            <td><strong>Yes</strong> — marker bytes from <em>other</em> allocations appear in the output, plus nine heap-like <code>0x7…</code> values spaced <code>0x40</code> apart, i.e. a HashTable bucket array.</td></tr>
+      </tbody>
+    </table>
+    <p style="color:var(--muted);font-size:12.5px;margin:14px 0 0">
+      Closed with one inequality rather than an eyeball: the read began in a 1024-byte buffer at
+      <code>V</code>, so it ends at <code>V+0x400</code>, and every leaked pointer lies <em>beyond</em>
+      that address. Masking one to Zend's 2 MiB alignment gives the allocator's chunk base — the input the
+      next two chain steps need. No code pointer, no forged structure, no control-flow change: this is
+      chain step 3.
     </p>
   </div>
 
@@ -229,8 +263,8 @@
         <div class="d">A small multipart body exhausts <code>memory_limit</code> while staying far inside <code>post_max_size</code>, during request startup.</div></li>
       <li class="done"><span class="t">Read stale state out of the previous request's memory</span><span class="tag done">demonstrated</span>
         <div class="d">After one aborted request, the next request on that worker has its session id taken from recycled memory — 18–20 of 20 runs, against 0 of 20 on a fresh worker and 0 of 20 on the patched build. A different producer geometry makes the same worker die on an allocation size taken from stale memory instead.</div></li>
-      <li><span class="t">Control content, location and timing of the corrupted memory</span><span class="tag gap">not demonstrated</span>
-        <div class="d">Heap grooming against both glibc malloc and Zend's allocator, so the invalid state contains attacker-chosen bytes.</div></li>
+      <li class="done"><span class="t">Control content, location and timing of the corrupted memory</span><span class="tag done">demonstrated</span>
+        <div class="d">Via an instrumented build: the stale pointer can be made to land <em>inside</em> a buffer we control, so the emitted length is attacker-chosen (4660 bytes from a claimed <code>0x1234</code>, 4/4 runs) and the read continues past our allocation into heap holding live pointers. Shown on Zend's allocator and a single worker; the glibc <code>malloc</code> pairing and multi-worker reliability are not.</div></li>
       <li><span class="t">Turn a read into a jump</span><span class="tag gap">not demonstrated</span>
         <div class="d">The stale value must be used as a pointer, length or index — plus an information leak to defeat ASLR/PIE.</div></li>
       <li><span class="t">Bypass mitigations</span><span class="tag gap">not demonstrated</span>
@@ -247,7 +281,7 @@
   </div>
 
   <footer>
-    Data from a local lab (PHP 8.4.26 vs 8.4.27, <code>127.0.0.1</code>; stage 2 measured on the Alpine builds).
+    Data from a local lab (PHP 8.4.26 vs 8.4.27, <code>127.0.0.1</code>; stage 2 measured on the Alpine builds, stage 3 on an instrumented 8.4.26 built from source).
     Advisories: GHSA-w8hw-w9fx-j79w · GHSA-6wmf-4rv5-p3rp · Fix commit <code>506e87fa</code> (ancestor of tag <code>php-8.4.27</code>) · Fixed in 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12.
   </footer>
 </div>
