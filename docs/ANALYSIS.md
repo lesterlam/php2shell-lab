@@ -798,3 +798,87 @@ the chunk, not *where a table* sits relative to it.
 
 Reproduce: `step4_fitsweep.py` (writes `fitsweep2.log`, per-run server logs under
 `fitsweep2-logs/`), probes added by `add-probes.py`.
+
+### 10.5 2026-10-28 — heap grooming on the stable pad: the bin goes to strings, every time
+
+§10.4 left a reproducible landing pad: 22 of 32 configurations put a dangling `PS(id)` on
+the wire, deterministically. That pad is what makes grooming possible — you cannot steer an
+allocation onto a chunk that only sometimes exists. This section is the first grooming
+attempt on it.
+
+The step-4 win condition is a layout fact, not a payload fact. A win needs
+`PS(id) == address(HashTable) + 0x10`, so that the 16-byte cookie read is
+`{HT+0x28 nNextFreeElement, HT+0x30 pDestructor}` — `16` followed by a code pointer.
+Nothing about the payload can substitute for the shift.
+
+Method. Hold the pad fixed (producer `PHPSESSID` = NUL, consumer id = 24 `a`) and vary only
+the consumer's array geometry: how many scalar fields precede the array (0, 8, 16, 32, 48,
+64, 72), where the array sits in the part order (front / tail), element size (8..64),
+element count (8/16/32), repeated arrays (2/4/8), and scalar value size (8/16/24/40). Every
+stale configuration is re-run once; a disagreement is reported as flaky. 35 configurations,
+46 pool runs, fresh server per run.
+
+Result: **18 stale, 0 wins, 0 flaky.** No configuration read a 16-byte length, and no read
+produced a code pointer. The pad itself is solid: a separate four-rep check on the baseline
+geometry read stale 4/4 with byte-identical bodies (92,411 B, verified against
+`step4_fitsweep.consumer`).
+
+The stale reads fall into three shapes, and the first two are new relative to §10.3:
+
+| configuration | length read | first 8 bytes | what the freed chunk was reused as |
+|---|---|---|---|
+| `end-f64-l16-v32` | `32` | `0x78` x 8 | **our own array element value**, `"x" * 32` |
+| `end-f48/f64/f72-l16-v16`, `end-f64-l8-v16`, `end-f64-x2/x8` | `5` | `61 30 30 38 30` = `"a0080"` | **our own multipart part name** |
+| `end-f64-l16-v8/v16/v40/v56/v64`, `s8`, `bin-id8-*` | `4294967297` | `0x8 0x1 <ptr> 0x700000001 ...` | unaligned/garbage words |
+| `end-f64-l16-v24`, `front-f0-l16-v16` | `9223372247559138859/960` | pointer-like words | ditto |
+
+**(a) A controlled read, on the wire.** `end-f64-l16-v32` is the PoC's "plant on the stale
+header" effect, reproduced without forging anything. The producer's request leaves the id
+chunk at `PS(id)`; the consumer's request reuses that exact address for one of its own array
+element strings. The A0 probe sees the same address in both requests:
+
+```
+producer: PS(id)=0x7e170e47d040 len=32  headers_sent=1   (live id)
+consumer: PS(id)=0x7e170e47d040 len=32  headers_sent=0   bytes = 0x78 * 32
+```
+
+and that value reaches the wire as the session id (`wire=id len=32 7878...`). So the
+content of the stale read is attacker-chosen and its length is attacker-chosen — when the
+bin reuse happens to be an array value string. That is a real capability, and it is why the
+`len=5` reads print our part names: same mechanism, different string.
+
+**(b) Why the HashTable never lands there — and why the "same size class" argument in §10.3
+was necessary but not sufficient.** A 16-element `HashTable` struct is 56 B and a 32-character
+string header is 57 B, so both round into the same 64-byte bin — §10.3 called this collision
+possible and the `value_size=256` runs showed it happening. But *sharing a bin* only means
+the table *could* win; it says nothing about who wins. In these requests the matching-class
+strings outnumber matching-class tables by roughly a hundred to one: every part name and
+every element value is a string, while the request builds one or two tables. The bin head is
+therefore taken by a string in essentially every request, and the read lands on a string
+header rather than a table. That is a quantitative explanation of the blocker, not a new
+observation about the allocator.
+
+**(c) The bin-steering variant also failed.** If strings win because there are more of them,
+remove them: keep every string in the body out of the 64-byte bin (id length 8, scalar and
+element values 8 or 16, so the smallest strings round to 32 or 48) and leave the table as the
+only 64-byte candidate. Four configurations, three stale, one healthy, **0 wins**. The reads
+that did occur were the `4294967297` garbage shape or a `len=5` part name, i.e. the bin went
+to a string anyway (a part name is 9 bytes, 34 B with the header, which rounds to 48 — so
+something else was taking it) or to nothing recognisable. Removing the obvious competitors
+did not hand the bin to the table.
+
+**(d) What this does and does not establish.** It establishes that the pad is stable enough to
+groom, that the dangling chunk is reliably reused by strings the same request supplies, and
+that the read's length and content can be chosen when the reuse is an array value. It does
+not establish a route to the `0x10` shift. Four hypotheses were tried across §10.3–§10.5 —
+producer geometry, offset position, two PoC knobs, and bin competition — and the shift
+appeared in none of them. The next step is therefore not another geometry sweep; it is a
+question about the mechanism itself. Either the reference PoC's `0x10` shift comes from an
+allocation path these bodies never exercise (its `heap_consumer()` sends a 79-byte value
+whose payload *is* a forged header, which is a different request shape from ours), or the
+"real `HashTable` at `PS(id)-0x10`" reading of its own numbers is wrong. Reading
+`stealmybitcoin_poc.py:228-245` against a live run of *its* request shape is the cheap way to
+decide, and it is the only step left that can distinguish those two.
+
+Reproduce: `step4_occupy.py` (writes `occupy.log`, per-run server logs under `occupy-logs/`).
+Total step-4 pool runs to date: 196 (92 §10.3, 54 §10.4, 46 + 4 here).

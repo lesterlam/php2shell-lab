@@ -157,8 +157,8 @@ always sees a healthy 32-byte id). Measurements in
 value size (39) §6/§7 happened to use. With producer value 1 or 24 the same consumer
 geometry does reach the stale read — in about half of fresh pools — and still yields no code
 pointer: a real `HashTable` would have to sit exactly `0x10` before the stale id string, and
-146 runs never produced that shift. Three sweeps — `step4_prodsweep.py`,
-`step4_offsweep.py`, `step4_fitsweep.py` — see §10.3 and §10.4. §10.4 also records a
+196 runs never produced that shift. Five sweeps — `step4_prodsweep.py`,
+`step4_offsweep.py`, `step4_fitsweep.py`, `step4_occupy.py` — see §10.3–§10.5. §10.4 also records a
 defect in the §10.3 measurement: probe A sat below `php_session_send_cookie()`'s
 `headers_sent` guard and was blind for 28 of 32 configurations.*
 
