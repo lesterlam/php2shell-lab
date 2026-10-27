@@ -152,6 +152,13 @@ site (13 value sizes swept, plus marker-bearing values at each size class; the r
 always sees a healthy 32-byte id). Measurements in
 [`docs/ANALYSIS.md` §10.2](docs/ANALYSIS.md).
 
+*Dated correction, 2026-10-28 — the read is at `PS(id) = HashTable + 0x10`, `len` from
+`ht+0x20` `nTableSize`; and the 24-byte-geometry sentence above holds only for the producer
+value size (39) §6/§7 happened to use. With producer value 1 or 24 the same consumer
+geometry does reach the stale read — in about half of fresh pools — and still yields no code
+pointer: a real `HashTable` would have to sit exactly `0x10` before the stale id string, and
+67 runs never produced that shift. Two sweeps, `step4_prodsweep.py`, see §10.3.*
+
 Before trusting a 32-byte id, check that the path is reachable at all:
 `GET /diag.php` prints the SAPI and the settings the upload-progress callback
 depends on. On a build where that callback is not wired up, every request

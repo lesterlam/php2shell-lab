@@ -606,7 +606,8 @@ build, and the reason is structural in two independent ways.
 **Its code-pointer read never uses a lying length.** The PoC's cookie is `{16,
 zval_ptr_dtor}` because `PS(id)` lands on a **HashTable struct + 0x18**: PHP reads `len`
 from `ht+0x28` (`nNextFreeElement == 16`, a packed 16-element array) and the cookie bytes
-from `ht+0x30` (`pDestructor == zval_ptr_dtor`). §7's attacker-controlled length — the
+from `ht+0x30` (`pDestructor == zval_ptr_dtor`). **[Corrected 2026-10-28: the struct is
+entered at `+0x10` and the length comes from `ht+0x20` `nTableSize` — see §10.3(a).]** §7's attacker-controlled length — the
 harder primitive this lab spent its Stage 3 on — is not part of that route at all. The
 PoC's consumer geometry is 73 field values of **24 bytes** plus **one 16-element array at
 field position 69**; this lab used 512 B and up. Note that §7.3's containment band
@@ -659,3 +660,69 @@ read needs it. At least one detail in the PoC must be reconstructed rather than 
 negative this way keeps the claim falsifiable: it names the two blockers, the source line
 for one of them, and the measurement for the other.
 
+
+### 10.3 2026-10-28 — the `+0x10` offset, and the producer's value size is the real lever
+
+Two claims in §10.2 do not survive measurement. Nothing above has been rewritten; this
+section is the correction.
+
+**(a) The offset is `+0x10`, and the length comes from `nTableSize`.** §10.2 says `PS(id)`
+lands on "a HashTable struct + 0x18" with `len` from `ht+0x28`. The real `struct
+_zend_array` (`Zend/zend_types.h`, 8.4.26) is `0x00` `gc`; `0x08` `u.flags` / `0x0c`
+`nTableMask`; `0x10` `arHash`/`arData`/`arPacked`; `0x18` `nNumUsed`/`nNumOfElements`;
+`0x20` `nTableSize`/`nInternalPointer`; `0x28` `nNextFreeElement`; `0x30` `pDestructor`.
+The PoC's check — `len == 16`, `cookie[0:8] == 16`, `cookie[8:16]` a code pointer whose low
+21 bits are the page offset `0x112930` — holds exactly when `PS(id) = HT + 0x10`:
+
+| read | field | value for a packed 16-element array |
+|---|---|---|
+| `len` <- `HT+0x20` | `nTableSize` \| `nInternalPointer` | `16` |
+| `cookie[0:8]` <- `HT+0x28` | `nNextFreeElement` | `16` |
+| `cookie[8:16]` <- `HT+0x30` | `pDestructor` | `zval_ptr_dtor` |
+
+`nTableSize` and `nNextFreeElement` are both 16 for a packed 16-element array, which is why
+the one-field error was invisible. The PoC's own Stage 4 forged table agrees: `arData` at
+`0x10`, `zif_system` at `0x30` (`stealmybitcoin_poc.py:369-374`).
+
+**(b) The 24-byte geometry claim needed a condition it did not state.** §10.2's "its
+24-byte geometry does not place the stale pointer at the read site" was measured with the
+producer of §6/§7 — depth 58 / count 935 / 65 fields / **value 39**. Sweeping the
+*producer's* geometry instead, fresh worker pool per run, consumer kept at the PoC's own
+calibration:
+
+| producer depth/count/fields/value | OOM | read at the PoC's consumer geometry |
+|---|---|---|
+| 58/935/65/39 | yes | healthy 32-byte id |
+| 58/935/65/1 | yes | `PS(id)` = one of our own value strings: `len=24`, content = our fill |
+| 58/935/65/24 | yes | `len=262`: a stale string read out of recycled heap |
+| 58/935/65/256 | yes | length read as the table's `arData`; PHP refuses the id, no cookie |
+| 40/1300/65/24 | **no** | invalid — no OOM |
+| 16/3300/65/24 | **no** | invalid — no OOM |
+
+Re-run for reproducibility (2 pools each): value 1 -> stale in 1 of 2; value 24 -> stale in
+3 of 4. Real, but not deterministic: about half of fresh pools. The size class that decides
+whether a small-value consumer reaches the stale block is therefore chosen by the
+**producer's** value size, and the 24-byte geometry does reach it at value 1 and 24 — it
+just does not reach a code pointer. Sweeping the consumer's array position over 0..160 (41
+positions, every stale one re-run once: 67 runs total) produced zero code-pointer reads,
+with one dominating landmark: `len=262`, `PS(id)` page-aligned, content = a leftover
+32-character id string followed by NUL and raw heap words.
+
+**(c) Why the reference PoC succeeds where these runs do not.** Its source
+(`stealmybitcoin_poc.py:228-245`) manufactures the structure it reads instead of looking
+for one. `heap_consumer()` sends a 79-byte value whose *payload* is a fake `zend_string`
+header — `struct.pack_into("<Q", forged, 0x10, 256)` writes the length field and
+`forged[0x18] = ord("L")` marks the leak's start — positioned so that payload lands on the
+stale string header ("Repeating numeric key 1050 changes the array's allocation pattern so
+the crafted value below lands on the stale string header"). Its code-pointer stage is the
+same trick with a hand-fitted trailing position (24-byte values, one 16-element array at
+position 69). What the code-pointer read needs is a real `HashTable` struct sitting exactly
+`0x10` bytes before the stale id string, because that is the only way a POST-shaped payload
+makes PHP read `nTableSize`, `nNextFreeElement` and `pDestructor` as one 16-byte string.
+Zend's segregated-fit allocator puts a `HashTable` struct (56 B) and a 32-character id
+string (57 B) in the same class, so that reuse is possible — and the value-256 runs show the
+class collision happening (the length is read as the table's `arData`). What 67 runs never
+produced is the `0x10` shift: `PS(id)` lands on the table's own base, not on `HT+0x10`.
+
+Reproduce: `step4_prodsweep.py --mode producer` and `--mode offset` (per-run server logs
+under `logs/`).
