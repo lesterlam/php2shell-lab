@@ -947,3 +947,58 @@ leaving the pointer dangling. Consequently:
 
 Reproduce: `step5_pipeline.py` (pipelining attempt), `step5_worker1.py` (single-worker
 replay, logs under `worker1-logs/`).
+
+### 10.7 2026-10-28 — FPM differential: headers-sent is reachable, but the id is never read
+
+§10.6 left one untested axis: the build. Every one of the 192 pooled runs used our instrumented
+source build under `php -S`. The extracted Docker image rootfs
+(`rt-alpine/php-8.4.26/rootfs`) is the same PHP 8.4.26 **without** the `INSTR-A0` probes, so it
+is the natural control. Docker has no daemon here, but the musl rootfs runs directly under its
+own loader, so no container is needed.
+
+**Transport.** `php-fpm` 8.4.26 runs from that rootfs on TCP 127.0.0.1:19426 with
+`pm = static`, `pm.max_children = 1`. A hand-written FastCGI client (stdlib only, ~90 lines,
+`step5_fpm.py`) sends the PoC's real bodies. The FCGI content-length field is 16-bit, so the
+251,557-byte producer body is split into 65,000-byte STDIN records. `pm.max_children=1` gives
+the same guarantee the reference lab got from nginx's keep-alive upstream: every request lands
+on the same child, so the poisoned worker serves all eight consumers.
+
+**Observable without probes.** `www/sessprobe.php` calls `session_start()` and prints
+`SID_LEN`/`SID_HEX`, i.e. the session id PHP actually resolved. Healthy = 32 hex chars.
+A leak would show as 16 bytes or as non-hex garbage.
+
+**Results — 1 producer + 8 consumers, same child:**
+
+| pool config | producer | consumers |
+|---|---|---|
+| `display_errors=1` | `OOM` + `HDRSENT` + `INPUTVARS`; no Set-Cookie | all 8: `HDRSENT` + `APP_REACHED`, **`SID_LEN=0`** |
+| `display_errors=0` | **0 bytes returned** (fatal goes to error_log only) | all 8: `APP_REACHED`, **`SID_LEN=32`**, each a *different* random id |
+
+`HDRSENT` is the warning `Session cookie cannot be sent after headers have already been sent`,
+emitted during request startup — i.e. the headers-sent path the instrumented build never reached
+(there `headers_sent=0` on all 32 configurations).
+
+**What this settles.**
+
+1. **The build differential is real.** The uninstrumented musl build *does* reach the
+   headers-sent state in the producer, and even in consumers when warnings are printed during
+   request startup. Our instrumented `php -S` build never did. So §10.6's suspicion — that the
+   observed `headers_sent=0` was an artefact of the instrumented build — is confirmed as the
+   right question to have asked.
+2. **But neither branch yields a readable stale id.** With `display_errors=1` the session cannot
+   be started at all once headers are sent (`session_start(): Session cannot be started after
+   headers have already been sent`), so *nothing reads the dangling pointer* — `SID_LEN=0`.
+   With `display_errors=0` headers are never sent, the session starts normally, and every
+   consumer gets a fresh 32-byte random id. There is no configuration in this build where the
+   session id is read from freed memory.
+3. **The remaining gap is ordering, not transport.** The reference PoC's observable requires a
+   state where headers are already sent (so the freshly generated cookie is not communicated)
+   *and* session startup still reads the id. Our build has those two conditions as mutually
+   exclusive: any startup output flushes headers, which then blocks the session. Whatever the
+   reference lab does differently, it must keep the two apart — e.g. a SAPI whose header flush
+   happens after the session read, or error output routed to a log while the session path
+   proceeds. That is now the only remaining difference worth testing, and it cannot be reached
+   by geometry or by worker count.
+
+Reproduce: `step5_fpm.py` (bodies from the reference PoC, byte-identical per §10.6), pool config
+`/opt/data/lab-scratch/fpm-smoke/fpm.conf`, per-consumer dumps in `fpm-logs/`.
