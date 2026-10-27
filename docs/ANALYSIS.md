@@ -395,30 +395,43 @@ emitted length always equalled the filler size.
 > The allocator's history differs between runs, so *which* offset inside the region
 > the stale pointer lands on moves. Hardcoding the band `[0x270, 0x2a0)` — as an
 > earlier revision of this lab did — therefore produced zero adoptions, which is why
-> §7.4 scouts the offset at runtime instead of assuming it. Read the offsets above as
+> §7.4 discovers the shape at runtime instead of assuming it. Read the offsets above as
 > *one* run's values, and the *containment* as the finding, not the number.
 
 ### 7.4 Measured: the length becomes ours
 
 Because the offset moves between runs (§7.3), a constant cannot aim at it. So
-`stage3.py` sends one **scout** request first — a producer plus a plain `P`-filled
-consumer whose only job is to be measured — reads the offset out of probe C, and
-only then builds the payload that stamps `0x1234` at every 8-aligned offset across a
-window around that measured offset. Any 8-aligned read inside the window yields the
+`stage3.py` discovers the shape instead of assuming one: it walks the value-size
+classes, sends a producer plus a plain `P`-filled consumer for each, reads the offset
+out of probe C, and once a shape is found that contains `PS(id)+0x10` at an offset
+`>= 0x18`, it builds the payload that stamps `0x1234` at every 8-aligned offset across
+a window around that measured offset. Any 8-aligned read inside the window yields the
 claim. From the run that gates CI:
 
 ```
-scout: PS(id)=0x7ad01a67d040 is inside a 1024-byte buffer at +0x128;
-       the len field PHP will read is at +0x138 of the value
-stamping 0x1234 at every 8-aligned offset in [0x128, 0x150) of a 1024-byte value
-
-rep    id len     verdict
-0      4660       *** length adopted our claim ***
-1      4660       *** length adopted our claim ***
-2      4660       *** length adopted our claim ***
+  aiming with fields=73, vsize=512: the len field is at +0x138 of the value
+  stamping 0x1234 at every 8-aligned offset in [0x128, 0x150)
+  rep    id len     verdict
+  0      4660       *** length adopted our claim ***
+  1      4660       *** length adopted our claim ***
 ```
 
+Getting here took two failures, and the second is the instructive one. A single
+scout on a **fresh** pool reported *no containment* at `vsize=1024` while containment
+mode — on its own pool, with several shapes already through it — was simultaneously
+measuring `+0x138` at that same size. Where the stale pointer lands depends on the
+pool's accumulated history, not only on the request, so a shape that works on a warmed
+pool does nothing on a fresh one. Discovering the shape per mode, rather than assuming
+one, is what made the claim reproducible — and it is why each mode gets its own pool
+(§7.6): the measurement has to be self-contained.
+
 4660 = `0x1234`. The length is now decoupled from the buffer it is read from.
+
+```
+read started in buffer 0x796fb607cf18 (len 512), which ends at 0x796fb607d118
+        *** 6 leaked value(s) lie BEYOND that end ***
+        -> 0x796fb607d180 & ~0x1FFFFF = 0x796fb6000000  (2 MiB-aligned Zend chunk)
+```
 
 ### 7.5 Measured: the tail is memory we did not write
 
