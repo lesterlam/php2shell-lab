@@ -726,3 +726,75 @@ produced is the `0x10` shift: `PS(id)` lands on the table's own base, not on `HT
 
 Reproduce: `step4_prodsweep.py --mode producer` and `--mode offset` (per-run server logs
 under `logs/`).
+
+### 10.4 2026-10-28 — the probe was blind, and what the two remaining knobs actually do
+
+**(a) A measurement defect in §10.3, found and fixed.** Probe A was inserted inside
+`php_session_send_cookie()` *below* its first statement:
+
+```c
+static zend_result php_session_send_cookie(void) {
+    smart_str ncookie = {0};
+    zend_string *date_fmt = NULL;
+    zend_string *e_id;
+
+    if (SG(headers_sent)) { ...; return FAILURE; }   /* probe A sat below this */
+```
+
+So whenever PHP warned before sending headers — which the stale-id path does — the function
+returned before the probe, and a run was recorded as "no cookie, no data" even though
+`PS(id)` had been dereferenced. Probe **A0** now sits at function entry, above the guard, and
+reports `send_cookie` and `headers_sent`; probe **D** sits in `ppid2sid()` right after the id
+is built from the upload-progress field. Applied by `add-probes.py` (idempotent), rebuilt
+with `make -j` in both instrumented trees.
+
+Two harness faults were fixed at the same time: a second sweep instance ran concurrently and
+interleaved two result blocks into one log (ports are deterministic per index), and the first
+rebuild went into `ci-sim4/` while the sweeps run `php-8.4.26/sapi/cli/php` — so probe A0 was
+absent from the binary under test. Both are now guarded (`fcntl` single-instance lock, pid in
+the log header).
+
+**(b) The two knobs, measured.** 32 configurations — the `PHPSESSID` field value length on
+each side (NUL, 16, 37, 56 bytes) crossed with the PoC's repeated-key churn (16 and 64 copies
+of one key, plain 24-byte values and the PoC's 79-byte forged `zend_string` header). Every
+configuration OOM'd the producer; 54 worker pools in total, re-runs included.
+
+| knob | result |
+|---|---|
+| `PHPSESSID` length, producer side | 0 wins. Shorter is the only usable range: at 16/37/56 the id stops being regenerated, `send_cookie` is never reached and the run ends with no `Set-Cookie` at all |
+| `PHPSESSID` length, consumer side | 0 wins, but it does move the class of the string that lands on the stale chunk — see (c) |
+| repeated-key churn (16, 64) | 0 wins and no change of symptom: every churned run reproduced the same `len=4294967297` read. It also pushed runs into the headers-already-sent path (`send_cookie=1 headers_sent=1`), i.e. no cookie |
+| probe D (`ppid2sid`) | **never fired in any of the 54 runs** — in this configuration the id is never adopted from a POST field, so the stale pointer is not "our field being adopted"; it dangles from an earlier request |
+
+**(c) What the stale reads are.** Two configurations read stale state reproducibly, both now
+visible at entry with `send_cookie=1 headers_sent=0`:
+
+```
+P-NUL+C-24 : [INSTR-A0] len=4294967297 (0x100000001)  first8=08 00 00 00 00 00 00 00
+P-NUL+C-37 : [INSTR-A0] len=5  bytes = 61 30 30 35 35  ("a0055")
+             wire Set-Cookie: PHPSESSID=a0055
+```
+
+`"a0055"` is a **field name from our own multipart body** (`a0055[0]`). In that pool the same
+pointer was logged in both requests:
+
+```
+producer : [INSTR-A0] entry PS(id)=0x7f307b87d040 val=+0x18 len=32  gc_refcount=1 gc_type=0x16
+consumer : [INSTR-A0] entry PS(id)=0x7f307b87d040 val=+0x18 len=5   bytes 61 30 30 35 35
+```
+
+Same address, different contents: `PS(id)` is a dangling pointer into a chunk that request
+shutdown returned to Zend MM and the next request's multipart parser handed back out for a
+field name. That is the PoC's plant-on-the-stale-header effect arriving by accident, and it
+reached the wire (a 5-byte `PHPSESSID`). What it never produced is a 16-byte read of
+`{16, pDestructor}`: the class that lands there is decided by whichever string the parser
+allocates next, and nothing in the two knobs makes a real `HashTable` struct land `0x10`
+before the stale pointer.
+
+**(d) Running total.** 146 pools across §10.3 and §10.4, zero code-pointer reads. The
+structural statement in §10.3(c) is unchanged and now better supported: what step 4 needs is
+a real `HashTable` at `stale - 0x10`, and the knobs tried so far move *which string* reuses
+the chunk, not *where a table* sits relative to it.
+
+Reproduce: `step4_fitsweep.py` (writes `fitsweep2.log`, per-run server logs under
+`fitsweep2-logs/`), probes added by `add-probes.py`.
