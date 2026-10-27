@@ -461,7 +461,12 @@ never produces. Nine found, spaced `0x40` apart — a HashTable bucket array:
 **The inequality.** The read started in a buffer at `0x72213927de18`, length 1024, so
 it ends at `0x72213927e218`. Every leaked pointer lies **beyond** that address. That
 comparison is the proof: the bytes are not ours, because they are outside the
-allocation they were read from. Masking one to Zend's 2 MiB chunk alignment gives
+allocation they were read from.
+
+> **Corrected 2026-10-28 — the inequality proves less than this paragraph claims.** It
+> proves the over-read; it does not prove the bytes are outside memory the *attacker*
+> controls. See [§10](#102026-10-28--the-75-inequality-proves-less-than-the-text-claims).
+> Subsequent measurement put all 20 leaked pointers inside our own POST-body buffers. Masking one to Zend's 2 MiB chunk alignment gives
 the chunk base — the input the next two chain steps need:
 
 ```
@@ -477,7 +482,8 @@ Establishes:
 - the emitted length is attacker-chosen and the read continues past the end of that
   allocation;
 - the tail contains live heap pointers, from which the allocator's chunk base
-  follows.
+  follows — qualified 2026-10-28: they are real chunk addresses *of our own POST
+  data* ([§10](#102026-10-28--the-75-inequality-proves-less-than-the-text-claims)).
 
 Does **not** establish:
 
@@ -553,3 +559,103 @@ result dated to this build is more useful than an assumed one.
 5. A container or cgroup `memory.max` can serve as a backstop, with caveats.
    **Do not use `RLIMIT_AS` or `RLIMIT_DATA`** — they make `mmap()` fail at the
    limit, which re-triggers the vulnerable `longjmp()` path.
+
+## 10. Corrections — dated
+
+Corrections are appended and dated. Superseded wording above is left standing, with a
+pointer to the correction, so the record shows what was believed and when it changed.
+
+### 10.1 2026-10-28 — the §7.5 inequality proves less than the text claims
+
+§7.5 argues from `V+0x400 < every leaked pointer` that "the bytes are not ours". The
+addresses are indeed outside *that* 1024-byte buffer, so the over-read (chain step 3) is
+proved. They are **not** shown to be outside memory the attacker controls.
+
+Measured on the same build (the §7.5 configuration plus two more; probe C logs the
+address of every controlled field value, so each leaked pointer can be attributed):
+
+| configuration | leaked pointers | pointing outside our own POST-body buffers |
+|---|---|---|
+| 73 fields x 1024 B | 6 | **0** |
+| 73 fields x 2048 B | 7 | **0** |
+| 32 fields x 2048 B | 7 | **0** |
+
+All 20 resolve into sibling allocations of the *same request's* POST body — Zend arena
+memory (`[anon:zend_alloc]`), stride `0x40`. Corrected reading: the §7.5 tail is memory
+we did not write **in that allocation** — an over-read past the claimed length, but still
+inside our own block. The chunk-base arithmetic survives (the addresses are real Zend
+chunk addresses); what it yields is the arena base of our own POST data, not of foreign
+structures. README's "the tail memory we did not write" carries the same qualification.
+
+Two harness notes from producing this table, both of which had already corrupted a
+conclusion before they were found:
+
+- `classify()` returns a `(kind, base, perm)` tuple; the check was `kind in ("text",
+  "lib")`, which never matched anything. The first "0 code pointers" result was this bug,
+  not a measurement.
+- The read never leaves the Zend allocator: `escaped` counts bytes past our buffer, but
+  the bytes there are the parser's own index for our POST data (a ~4 KB bucket array),
+  then zeroed heap.
+
+### 10.2 2026-10-28 — Step 4: the public PoC's code-pointer route, identified but not transferable
+
+Chain step 4 is heap base -> code pointer. A public PoC does reach a code pointer, and
+reading it against this lab resolves the route exactly — but it does not transfer to this
+build, and the reason is structural in two independent ways.
+
+**Its code-pointer read never uses a lying length.** The PoC's cookie is `{16,
+zval_ptr_dtor}` because `PS(id)` lands on a **HashTable struct + 0x18**: PHP reads `len`
+from `ht+0x28` (`nNextFreeElement == 16`, a packed 16-element array) and the cookie bytes
+from `ht+0x30` (`pDestructor == zval_ptr_dtor`). §7's attacker-controlled length — the
+harder primitive this lab spent its Stage 3 on — is not part of that route at all. The
+PoC's consumer geometry is 73 field values of **24 bytes** plus **one 16-element array at
+field position 69**; this lab used 512 B and up. Note that §7.3's containment band
+(`off >= 0x18` and `off + 0x18 <= vsize`) is unsatisfiable below `vsize` 32, so a
+containment sweep can never visit that geometry.
+
+**Blocker 1 — the published transport cannot be hosted by the SAPI the PoC names.**
+`sapi/cli/php_cli_server.c:394` appends `Connection: close` unconditionally to every
+response, and the file contains no keep-alive machinery (`conn_close` does not exist in
+it). The PoC sends one `sendall` carrying nine HTTP requests on one connection — producer
+keep-alive plus eight pipelined consumers, written before any response is read — so the
+consumers are served by the worker whose heap the producer just exhausted. Measured on
+three configurations:
+
+| probe | instrumented, 4 workers | stock 8.4.26, 4 workers | single worker |
+|---|---|---|---|
+| one keep-alive GET | 1 response | 1 response | 1 response |
+| two pipelined GETs, one `sendall` | **0 responses** | **0 responses** | **0 responses** |
+| two sequential GETs, one connection | 1, then closed | 1, then closed | 1, then closed |
+
+A php-fpm + nginx front-end does not substitute: FastCGI carries no client-connection
+affinity, so the nine requests would be dispatched to whichever worker is free, which
+removes the only thing the pipeline was for. Copying the PoC's builders verbatim against
+this lab's server reproduces the rejection: producer + one pipelined consumer in a single
+`sendall` -> 0 bytes, `Invalid request (Malformed HTTP request)` in the server log.
+
+**Blocker 2 — the 24-byte geometry does not reproduce the stale read here, measured at
+the read site.** Producer from §7, then the PoC's consumer, with probe A logging every
+consumer read:
+
+```
+[INSTR-A] PS(id)=0x722dcc6c9000 val=PS(id)+0x18 len=32 gc_refcount=1 gc_type=0x16
+[INSTR-A] bytes(32): 32 38 66 66 33 65 66 33 ...      ("28ff3ef3...", valid hex)
+```
+
+Stable address, live refcount, valid hex: `PS(id)` is not stale, PHP regenerated the id.
+A sweep of 13 consumer value sizes (8..512) x 2 pools x 4 consumers, over fresh
+connections, saw only clean 32-byte ids or no cookie. To test the allocation-order
+hypothesis directly, marker-bearing values (`PPPP...`) at 32, 40 and 64 bytes make probe C
+log all 73 controlled field addresses in each run; at every size the read site's `PS(id)`
+matched **none** of them and read a healthy 32-byte id (0/9). With 512-byte values the
+stale pointer *is* contained — §7.3 measures it — so this is a size-class effect, not an
+absence of corruption.
+
+**Conclusion.** The disclosure primitive reproduces (§6, §7). The calibration that turns
+it into a code-pointer over-read does not: its transport is impossible on the SAPI it
+names, and its small-value geometry never places the stale pointer where the hash-table
+read needs it. At least one detail in the PoC must be reconstructed rather than observed
+— its README concedes the original run never captured its own wire traffic. Reporting the
+negative this way keeps the claim falsifiable: it names the two blockers, the source line
+for one of them, and the measurement for the other.
+

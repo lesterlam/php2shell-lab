@@ -130,9 +130,27 @@ a 1024-byte buffer at `V`, so it ends at `V+0x400`, and every leaked pointer lie
 beyond that address. Masking one to Zend's 2 MiB alignment gives the allocator's
 chunk base — the input the next chain steps need.
 
+> **Corrected 2026-10-28.** "Beyond that address" means beyond *that buffer*, not beyond
+> memory we control: the inequality proves the over-read, and all 20 leaked pointers
+> measured since resolve into sibling buffers of the *same* POST body. The chunk base it
+> yields is the Zend arena holding our own data, not a foreign structure. See
+> [`docs/ANALYSIS.md` §10.1](docs/ANALYSIS.md).
+
 [`docs/ANALYSIS.md` §7](docs/ANALYSIS.md) carries the method and the raw numbers.
 This is chain step 3 of 6: no code pointer, no forged structure, no control-flow
 change.
+
+Chain step 4 (heap base → code pointer) was then investigated against the public PoC and
+is reported as a **negative with its blockers named**: the PoC's code-pointer read is
+identified byte-exactly (a HashTable struct at `PS(id)`, `len` from `ht+0x28`
+`nNextFreeElement`, cookie bytes from `ht+0x30` `pDestructor == zval_ptr_dtor` — no lying
+length involved), but its published transport cannot be hosted by the SAPI it names
+(`sapi/cli/php_cli_server.c:394` appends `Connection: close` unconditionally; two
+pipelined requests on one connection get **zero** responses, measured on three
+configurations), and its 24-byte geometry does not place the stale pointer at the read
+site (13 value sizes swept, plus marker-bearing values at each size class; the read site
+always sees a healthy 32-byte id). Measurements in
+[`docs/ANALYSIS.md` §10.2](docs/ANALYSIS.md).
 
 Before trusting a 32-byte id, check that the path is reachable at all:
 `GET /diag.php` prints the SAPI and the settings the upload-progress callback
