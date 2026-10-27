@@ -116,3 +116,37 @@ jobs:
           name: stage2-output
           path: stage2-output.txt
           if-no-files-found: warn
+
+  stage3:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Make scripts executable
+        run: chmod +x ./*.sh
+
+      - name: Build an instrumented php and measure
+        run: ./stage3.sh --reps 3 2>&1 | tee stage3-output.txt
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## Stage 3 -- attacker-controlled length, and an out-of-buffer read"
+            echo
+            echo '```'
+            sed -n '/^VERDICT/,$p' stage3-output.txt 2>/dev/null || echo "(no verdict)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage3-output
+          path: |
+            stage3-output.txt
+            logs/
+          if-no-files-found: warn
