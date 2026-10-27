@@ -704,7 +704,7 @@ Re-run for reproducibility (2 pools each): value 1 -> stale in 1 of 2; value 24 
 whether a small-value consumer reaches the stale block is therefore chosen by the
 **producer's** value size, and the 24-byte geometry does reach it at value 1 and 24 — it
 just does not reach a code pointer. Sweeping the consumer's array position over 0..160 (41
-positions, every stale one re-run once: 67 runs total) produced zero code-pointer reads,
+positions, every stale one re-run once: 72 runs total) produced zero code-pointer reads,
 with one dominating landmark: `len=262`, `PS(id)` page-aligned, content = a leftover
 32-character id string followed by NUL and raw heap words.
 
@@ -721,7 +721,7 @@ position 69). What the code-pointer read needs is a real `HashTable` struct sitt
 makes PHP read `nTableSize`, `nNextFreeElement` and `pDestructor` as one 16-byte string.
 Zend's segregated-fit allocator puts a `HashTable` struct (56 B) and a 32-character id
 string (57 B) in the same class, so that reuse is possible — and the value-256 runs show the
-class collision happening (the length is read as the table's `arData`). What 67 runs never
+class collision happening (the length is read as the table's `arData`). What 92 runs never
 produced is the `0x10` shift: `PS(id)` lands on the table's own base, not on `HT+0x10`.
 
 Reproduce: `step4_prodsweep.py --mode producer` and `--mode offset` (per-run server logs
