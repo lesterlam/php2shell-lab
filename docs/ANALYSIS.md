@@ -875,10 +875,75 @@ producer geometry, offset position, two PoC knobs, and bin competition — and t
 appeared in none of them. The next step is therefore not another geometry sweep; it is a
 question about the mechanism itself. Either the reference PoC's `0x10` shift comes from an
 allocation path these bodies never exercise (its `heap_consumer()` sends a 79-byte value
-whose payload *is* a forged header, which is a different request shape from ours), or the
-"real `HashTable` at `PS(id)-0x10`" reading of its own numbers is wrong. Reading
-`stealmybitcoin_poc.py:228-245` against a live run of *its* request shape is the cheap way to
-decide, and it is the only step left that can distinguish those two.
+whose payload *is* a forged header), or the "real `HashTable` at `PS(id)-0x10`" reading of
+its own numbers is wrong. Reading `stealmybitcoin_poc.py:228-245` against a live run of
+*its* request shape is the cheap way to decide, and it is the only step left that can
+distinguish those two. §10.6 does exactly that, and both branches turn out to be wrong: the
+bodies are byte-identical and the blocker is the build, not the request.
 
 Reproduce: `step4_occupy.py` (writes `occupy.log`, per-run server logs under `occupy-logs/`).
 Total step-4 pool runs to date: 196 (92 §10.3, 54 §10.4, 46 + 4 here).
+
+### 10.6 2026-10-28 — the bodies are byte-identical; the gap is the build, not the request
+
+§10.5(d) left one cheap question: does the reference PoC's `0x10` shift come from a request
+shape our bodies never exercise? It does not. Importing the reference script and comparing
+bodies byte-for-byte:
+
+```
+P.leak_producer(STAGES["code"].producer) == F.producer(PGEO, b"\x00")   True   251,557 B
+P.code_consumer()                       == consumer2(b"a",73,69,16,16,24) True  92,388 B
+```
+
+So every request this lab has been sending since §10.2 is byte-identical to the reference
+PoC's. The "different request shape" branch of §10.5(d) is dead. Three further measurements
+were made against the reference's own code path.
+
+**(a) php -S cannot pipeline, so the reference's send pattern cannot be replayed literally.**
+`run_leak_stage()` sends **one** `sendall` carrying nine HTTP requests (1 producer +
+`CONSUMERS=8`) on a single keep-alive connection. Against our CLI server the same write
+returns **zero bytes** — not even the first response. This is not about size: two small
+`GET`s concatenated in one sendall also return zero bytes. The CLI server does not support
+HTTP pipelining. (`step5_pipeline.py`; the server closes with no response, and no request
+ever reaches the script.)
+
+**(b) Worker pinning is not the missing piece either.** The reason the reference pipelines is
+worker pinning: in its Docker lab the client talks to nginx, which holds one keep-alive
+upstream connection, so the poisoned worker is guaranteed to serve all eight consumers. We
+emulated that deterministically without pipelining by running `PHP_CLI_SERVER_WORKERS=1` and
+sending the same 1 + 8 sequence sequentially (`step5_worker1.py`, two reps, 16 consumers
+total). The producer does OOM — the fatal error is in the *response body*
+(`Allowed memory size of 134217728 bytes exhausted`), and `classify()` tags it `OOM`; the
+build's `memory_limit` is 128M. Result: **16/16 consumers read a healthy 32-byte session id**
+(`len=32`, `gc_type=0x16`, `headers_sent=0`, 32 random hex bytes), zero stale reads, zero
+16-byte reads.
+
+**(c) The mechanism difference is visible in the producer's own error output.** The 634-byte
+OOM page contains, in order: `Input variables exceeded 1000`, then **`Session cookie cannot
+be sent after headers have already been sent`**, then the memory fatal. That second warning is
+the vulnerable state: by the time session startup runs, headers are already sent, so PHP
+cannot write a fresh id cookie — and in the reference build the `PS(id)` pointer is then left
+dangling instead of being replaced. In our consumer requests `headers_sent=0`, so PHP
+generates a brand-new 32-byte id and overwrites the stale pointer. The stale reads this lab
+has been studying (22/32 configurations) come from the configurations where the consumer's
+own request *does* reach the headers-sent path — they are a real phenomenon in our build, but
+they are not the reference primitive.
+
+**What this means for step 4.** Request geometry, worker count and pipelining are now all
+excluded as explanations. The remaining differences between our lab and the reference lab are:
+the C library (glibc here, musl/Alpine there), our source instrumentation (the `INSTR-A0`
+probes added to the PHP source to make these reads observable), and php.ini defaults. Any of
+those can change the allocation history enough that PHP regenerates the session id instead of
+leaving the pointer dangling. Consequently:
+
+- further geometry or bin-competition sweeps cannot produce the reference `0x10` shift, and
+  should not be run;
+- the step-4 "stable pad" is a property of *this instrumented build's* headers-sent path, not
+  a reproduction of the reference primitive, so it cannot be used as evidence for or against
+  the PoC's stage-2/3 claims;
+- ground-truthing the reference leak requires the reference's own environment (its Docker
+  lab: Alpine musl + uninstrumented 8.4.26), not this build. That is a distinct piece of work,
+  and it is the only way left to settle what the `0x10` shift actually depends on.
+
+Reproduce: `step5_pipeline.py` (pipelining attempt), `step5_worker1.py` (single-worker
+replay, logs under `worker1-logs/`).
