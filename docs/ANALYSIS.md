@@ -1002,3 +1002,71 @@ emitted during request startup — i.e. the headers-sent path the instrumented b
 
 Reproduce: `step5_fpm.py` (bodies from the reference PoC, byte-identical per §10.6), pool config
 `/opt/data/lab-scratch/fpm-smoke/fpm.conf`, per-consumer dumps in `fpm-logs/`.
+
+### 10.8 2026-10-28 — reference binary, single worker, real OOM: still no leak
+
+§10.6 raised "build mismatch" as the likely reason the instrumented build never reached the
+headers-sent state. That hypothesis was tested against the **clean reference Alpine musl 8.4.26
+binary** (`rt-alpine/php-8.4.26/rootfs`, `zval_ptr_dtor = 0x712930`, low21 `0x112930` matching
+`DTOR_LOW21`) — not an instrumented rebuild. Result: **the leak still does not reproduce.**
+
+**Run A — reference binary, `PHP_CLI_SERVER_WORKERS=4`, stdlib fan-out proxy on :19526.**
+Ten runs. Every run: producer reaches `INPUTVARS` + `HDRSENT` + `OOM`; all eight consumers return
+fresh 32-byte random ids; PoC aborts with `RuntimeError: heap: expected one strict address,
+found 0`. Identical to the instrumented build's 192-run null result. **Build mismatch is falsified
+as the sole cause.**
+
+**Why the fan-out harness was itself wrong.** The access log (worker-pid prefixed) for one run:
+
+```
+352815  GET  /php-version.php      (health)
+352815  POST /php-version.php
+352816  POST /php-version.php
+352817  POST /php-version.php
+352816  POST /php-version.php
+352815  POST /php-version.php
+352815  POST /php-version.php
+352814  POST /php-version.php
+352811  POST /php-version.php
+```
+
+Eight consumers landed on **five different workers**. The producer's stale heap lives in one
+worker; four-fifths of consumers never touch it. The PoC's premise is single-worker serialization
+(nginx upstream keep-alive → one FPM child), which a per-request-connection fan-out proxy destroys.
+So the ten-run null result could not distinguish "geometry wrong" from "consumers never met the
+dirty worker."
+
+**Run B — the decisive control: one worker.** `PHP_CLI_SERVER_WORKERS=1` is rejected by the CLI
+server ("number of workers must be larger than 1"), but the fallback is a **single worker process**
+(PID 352894) — exactly the serialization the PoC assumes. All nine requests necessarily hit that
+one worker. Producer response confirmed the full target state:
+
+```
+Warning: PHP Request Startup: Input variables exceeded 1000
+Warning: PHP Request Startup: Session cookie cannot be sent after headers have already been sent
+Fatal error: Allowed memory size of 134217728 bytes exhausted (tried to allocate 20480 bytes)
+```
+
+Single worker, real OOM, headers-sent reached — and all eight consumers still returned fresh
+32-byte random ids. `heap: expected one strict address, found 0`.
+
+**What this settles.**
+
+1. **Build mismatch: falsified as sole cause.** The reference binary fails identically.
+2. **Harness fidelity: falsified.** Worker distribution was the suspicion; with forced
+   single-worker serialization the result is unchanged. The consumers *did* meet the dirty worker
+   and still read nothing stale.
+3. **The geometry does not reproduce in this environment.** The remaining difference is the one
+   §10.7 already isolated: this build makes "headers already sent" and "session startup reads the
+   id" mutually exclusive. Once the producer's warning output flushes headers, the session path
+   returns before the `PS(id)` dereference. No worker count, connection shape, or heap groom
+   reaches a state where the id is read from freed memory.
+
+**Recommendation: stop attempting to reproduce Step 4 here.** The gap is SAPI header-flush
+ordering relative to the session read — a property of the server/SAPI, not of the request bytes.
+Closing it needs a SAPI whose header flush happens after the session id read (or error output to a
+log while the session path proceeds), which the PHP CLI server does not provide. Further runs on
+this harness cannot produce the leak; they can only re-confirm this null.
+
+Artefacts: `/opt/data/lab-scratch/poclab/runW` (4-worker) and `runW1` (single-worker),
+`logs/php-s.log`, `logs/php-s1.log`.
