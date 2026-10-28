@@ -247,6 +247,13 @@ build-instrumented.sh build php 8.4.26 + the three address probes
 instrument-php.py   the probe patches themselves (anchored insertion)
 demo.sh             one-command A/B walkthrough
 verify.sh           non-interactive gate (asserts vulnerable != patched)
+harness/fanout_proxy.py   stdlib nginx stand-in: fans one pipelined client
+                    stream out to N concurrent backend connections and relays
+                    nine responses back in order (see ANALYSIS 10.8 - without
+                    this, all nine requests land on one worker)
+harness/step5_pipeline.py   drives producer + 8 consumers through the proxy
+harness/step5_worker1.py    single request body generator (byte-identical, 10.6)
+harness/step5_fpm.py        FPM pool variant of the same differential
 www/                probe endpoints (index.php, upload.php, diag.php)
 docs/ANALYSIS.md    root-cause and patch analysis
 docs/index.html     interactive visualiser (GitHub Pages)
